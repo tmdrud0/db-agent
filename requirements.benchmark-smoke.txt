@@ -1,5 +1,5 @@
 # Dependencies for the official DB environment, simulator initialization and runner.
-# The empty-submit and oracle checks never call an LLM.
+# The oracle checks never call an LLM; the agent baseline calls it from the host.
 -r requirements.txt
 pydantic-settings>=2.2,<3
 python-dotenv>=1,<2
