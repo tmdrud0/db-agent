@@ -60,6 +60,11 @@ Skill 추가가 새 채팅이나 자동 메시지 전달을 만들지는 않는�
 
 ## 커밋과 검토 대상
 
+작업 ID가 있는 커밋은 공통 지침에 따라 제목을 `[<작업 ID>] <type>: <변경 요약>`으로 작성한다.
+구현·리뷰 수정·명세·보고서 커밋 모두 작업 ID를 맨 앞에 붙인다.
+예: `[TASK-001] feat: replace the empty SQL stub`, `[TASK-001] docs: record the implementation report`.
+작업 ID가 없는 변경은 ID를 임의로 만들거나 관계없는 TASK에 연결하지 않는다.
+
 코드 기준은 브랜치 이름보다 전체 커밋 SHA로 고정한다.
 아래 명령의 `BASE_SHA`, `CODE_SHA`는 보고서에 기록된 실제 SHA로 바꾼다.
 
@@ -115,6 +120,7 @@ $dev-implement
 명세: docs/agent/tasks/TASK-001/spec.md
 명세 커밋: <조율자가 전달한 전체 SHA>
 구현·검증 후 코드와 테스트를 로컬 커밋해줘.
+커밋 제목은 [TASK-001] <type>: <변경 요약> 형식으로 작성해줘.
 코드 SHA와 결과를 docs/agent/tasks/TASK-001/implementation.md에 기록해줘.
 ```
 
