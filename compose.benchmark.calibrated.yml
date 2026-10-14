@@ -1,0 +1,18 @@
+# Calibrated evaluation stack (TASK-002).
+#
+# Selects the wrapper that applies the dataset's public preparation statements
+# at evaluation time, and mounts the private calibration config.
+# The default stack in compose.benchmark.yml stays untouched, so the original
+# evaluation remains the default choice and switching is explicit:
+#
+#   docker compose -p db-agent-smoke -f compose.benchmark.yml -f compose.benchmark.calibrated.yml up --build -d --wait
+services:
+  db-environment:
+    command: ["python", "-m", "uvicorn", "db_env_calibration:create_app", "--factory",
+              "--host", "0.0.0.0", "--port", "6002"]
+    environment:
+      PYTHONPATH: /benchmark:/calibration
+      CALIBRATION_CONFIG: /calibration-data/TASK-002.calibration.json
+    volumes:
+      - ./benchmark/calibration:/calibration:ro
+      - ./private/calibration:/calibration-data:ro
