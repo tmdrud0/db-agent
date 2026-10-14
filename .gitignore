@@ -1,0 +1,13 @@
+.venv/
+.runtime-tmp/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.commandcode/
+.vscode/
+vendor/
+private/
+results/
+bird_interact_gt_*.jsonl

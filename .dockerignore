@@ -1,0 +1,6 @@
+*
+!benchmark/
+!benchmark/Dockerfile
+!requirements.txt
+!requirements.benchmark-smoke.txt
+!requirements.benchmark.lock.txt

@@ -1,0 +1,7 @@
+# Dependencies for the official DB environment, simulator initialization and runner.
+# The empty-submit and oracle checks never call an LLM.
+-r requirements.txt
+pydantic-settings>=2.2,<3
+python-dotenv>=1,<2
+psycopg2-binary>=2.9,<3
+sqlglot>=23,<31

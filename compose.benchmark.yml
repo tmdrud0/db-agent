@@ -1,0 +1,47 @@
+x-benchmark: &benchmark
+  build:
+    context: .
+    dockerfile: benchmark/Dockerfile
+  image: db-agent-benchmark-runtime:local
+  environment:
+    DATASET: lite
+    PG_HOST: postgresql
+    PG_PORT: 5432
+    PG_USER: root
+    PG_PASSWORD: "123123"
+    SYSTEM_AGENT_PORT: 6000
+    USER_SIM_PORT: 6001
+    DB_ENV_PORT: 6002
+  volumes:
+    - ./vendor/BIRD-Interact/BIRD-Interact-ADK:/benchmark:ro
+  depends_on:
+    postgresql:
+      condition: service_healthy
+
+services:
+  postgresql:
+    image: docker.io/shawnxxh/bird-interact-postgresql@sha256:1ae45d7aa5d64dd8eb82e4058f56b4b9625d5035b9b9dc0d2afa0295d9d3053c
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: "123123"
+    command: ["-c", "max_connections=300", "-c", "shared_buffers=256MB"]
+    volumes:
+      - postgresql_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U root -d postgres && PGPASSWORD=123123 psql -h 127.0.0.1 -U root -d postgres -tAc \"SELECT count(*) FROM pg_database WHERE datistemplate AND datname LIKE '%_template'\" | grep -qx 18"]
+      interval: 5s
+      timeout: 5s
+      retries: 120
+
+  db-environment:
+    <<: *benchmark
+    command: ["python", "-m", "uvicorn", "db_environment.server:app", "--host", "0.0.0.0", "--port", "6002"]
+    ports: ["127.0.0.1:6002:6002"]
+
+  user-simulator:
+    <<: *benchmark
+    command: ["python", "-m", "uvicorn", "user_simulator.server:app", "--host", "0.0.0.0", "--port", "6001"]
+    ports: ["127.0.0.1:6001:6001"]
+
+volumes:
+  postgresql_data:

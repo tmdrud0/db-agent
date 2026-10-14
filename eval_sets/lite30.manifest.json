@@ -1,0 +1,255 @@
+{
+  "name": "lite30",
+  "purpose": "temporary development evaluation",
+  "algorithm": "category-proportional-largest-remainder-v1",
+  "category_field": "category (Phase 1)",
+  "size": 30,
+  "seed": 20261014,
+  "source_public_sha256": "5626b6fd46df4828a3738d6bf9611198f5b48de1f840db415e274e1089872796",
+  "source_category_counts": {
+    "Query": 195,
+    "Management": 105
+  },
+  "selected_category_counts": {
+    "Query": 20,
+    "Management": 10
+  },
+  "selected_database_counts": {
+    "mental": 6,
+    "fake": 4,
+    "disaster": 1,
+    "gaming": 2,
+    "news": 3,
+    "vaccine": 3,
+    "cross_db": 3,
+    "archeology": 1,
+    "robot": 2,
+    "solar": 2,
+    "museum": 1,
+    "cybermarket": 1,
+    "virtual": 1
+  },
+  "selected_difficulty_counts": {
+    "Challenging": 7,
+    "Moderate": 14,
+    "Medium": 3,
+    "Simple": 5,
+    "Hard": 1
+  },
+  "aggregation": "equal task weights; official phase rewards remain 0.7/0.3",
+  "selected_ids": [
+    "mental_1",
+    "fake_2",
+    "disaster_2",
+    "mental_M_2",
+    "mental_M_6",
+    "gaming_11",
+    "news_6",
+    "news_11",
+    "vaccine_M_4",
+    "cross_db_M_2",
+    "archeology_3",
+    "robot_8",
+    "solar_M_5",
+    "museum_M_4",
+    "solar_4",
+    "robot_M_3",
+    "fake_11",
+    "cybermarket_4",
+    "cross_db_M_5",
+    "virtual_M_4",
+    "mental_3",
+    "fake_3",
+    "news_M_4",
+    "fake_6",
+    "gaming_2",
+    "vaccine_5",
+    "mental_10",
+    "mental_2",
+    "vaccine_4",
+    "cross_db_4"
+  ],
+  "selected_tasks": [
+    {
+      "instance_id": "mental_1",
+      "selected_database": "mental",
+      "category": "Query",
+      "difficulty_tier": "Challenging"
+    },
+    {
+      "instance_id": "fake_2",
+      "selected_database": "fake",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "disaster_2",
+      "selected_database": "disaster",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "mental_M_2",
+      "selected_database": "mental",
+      "category": "Management",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "mental_M_6",
+      "selected_database": "mental",
+      "category": "Management",
+      "difficulty_tier": "Medium"
+    },
+    {
+      "instance_id": "gaming_11",
+      "selected_database": "gaming",
+      "category": "Query",
+      "difficulty_tier": "Medium"
+    },
+    {
+      "instance_id": "news_6",
+      "selected_database": "news",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "news_11",
+      "selected_database": "news",
+      "category": "Query",
+      "difficulty_tier": "Medium"
+    },
+    {
+      "instance_id": "vaccine_M_4",
+      "selected_database": "vaccine",
+      "category": "Management",
+      "difficulty_tier": "Simple"
+    },
+    {
+      "instance_id": "cross_db_M_2",
+      "selected_database": "cross_db",
+      "category": "Management",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "archeology_3",
+      "selected_database": "archeology",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "robot_8",
+      "selected_database": "robot",
+      "category": "Query",
+      "difficulty_tier": "Challenging"
+    },
+    {
+      "instance_id": "solar_M_5",
+      "selected_database": "solar",
+      "category": "Management",
+      "difficulty_tier": "Simple"
+    },
+    {
+      "instance_id": "museum_M_4",
+      "selected_database": "museum",
+      "category": "Management",
+      "difficulty_tier": "Simple"
+    },
+    {
+      "instance_id": "solar_4",
+      "selected_database": "solar",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "robot_M_3",
+      "selected_database": "robot",
+      "category": "Management",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "fake_11",
+      "selected_database": "fake",
+      "category": "Query",
+      "difficulty_tier": "Hard"
+    },
+    {
+      "instance_id": "cybermarket_4",
+      "selected_database": "cybermarket",
+      "category": "Query",
+      "difficulty_tier": "Simple"
+    },
+    {
+      "instance_id": "cross_db_M_5",
+      "selected_database": "cross_db",
+      "category": "Management",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "virtual_M_4",
+      "selected_database": "virtual",
+      "category": "Management",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "mental_3",
+      "selected_database": "mental",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "fake_3",
+      "selected_database": "fake",
+      "category": "Query",
+      "difficulty_tier": "Challenging"
+    },
+    {
+      "instance_id": "news_M_4",
+      "selected_database": "news",
+      "category": "Management",
+      "difficulty_tier": "Simple"
+    },
+    {
+      "instance_id": "fake_6",
+      "selected_database": "fake",
+      "category": "Query",
+      "difficulty_tier": "Challenging"
+    },
+    {
+      "instance_id": "gaming_2",
+      "selected_database": "gaming",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "vaccine_5",
+      "selected_database": "vaccine",
+      "category": "Query",
+      "difficulty_tier": "Challenging"
+    },
+    {
+      "instance_id": "mental_10",
+      "selected_database": "mental",
+      "category": "Query",
+      "difficulty_tier": "Challenging"
+    },
+    {
+      "instance_id": "mental_2",
+      "selected_database": "mental",
+      "category": "Query",
+      "difficulty_tier": "Challenging"
+    },
+    {
+      "instance_id": "vaccine_4",
+      "selected_database": "vaccine",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    },
+    {
+      "instance_id": "cross_db_4",
+      "selected_database": "cross_db",
+      "category": "Query",
+      "difficulty_tier": "Moderate"
+    }
+  ],
+  "source_public_canonical_sha256": "a746277353be1d60eabcd4e1d69546aed30f0863ef35e80b545c136ec69df61e"
+}
