@@ -1,14 +1,58 @@
 # TASK-002 구현 보고서
 
 작업 ID: TASK-002
-명세 버전: 1
-대상 코드 버전: 377db5550bb5a32ec74d6463ddc1395d233a3e2d
+명세 버전: 2
+대상 코드 버전: f13b9c563ed30f1ddc1a68ff293fc2832348e6f3
 상태: ready_for_review
 요약: oracle Phase 2 실패 4건의 원인을 격리 DB에서 확정하고, 공식 파이프라인이 무시하는 공개 준비 필드(`preprocess_sql`, `clean_up_sqls`)를 평가 시점에 적용하는 선택적 보정 wrapper와 cross_db_M_5의 record 표현 typo 1건 데이터 보정으로 보정본 30문제 oracle을 Phase 1 30/30·Phase 2 30/30·평균 보상 1.0으로 만들었다. GT 3건은 수정하지 않았고 원본 입력·vendor 코드·기본 실행은 그대로다.
 근거: `benchmark/calibration/`, `compose.benchmark.calibrated.yml`, `scripts/`, `tests/test_calibration.py`, `private/calibration/TASK-002.calibration.json`, `results/dev30_oracle_calibrated.json`.
-미확정 사항: 없음.
+후속 요약: 사용자 요청에 따라 R-2의 SQL 키 생략 처리를 한 줄 수정하고 tests/test_verify_calibration.py를 추가해 65개 계약 테스트를 통과했다. R-1은 보류한다.
+미확정 사항: 새 코드 SHA에 대한 독립 재리뷰는 아직 수행하지 않았다. R-1은 사용자 요청으로 보류하며 알려진 제한으로 남는다.
 
-## 커밋과 검토 범위
+## 후속 구현 — R-2 수정과 R-1 보류
+
+2026-10-14 사용자 요청: “네가 그렇게 수정하고 r1은 내비두자 일단”.
+명세 버전 2 커밋: 38ef6d70e28bc0b5cee0e09d963d51cfa51a8336.
+원래 기준 SHA: 78d68541c6653c3d74776d135463f1afd8cdfd28 (유지).
+최초 보정 구현 SHA: 377db5550bb5a32ec74d6463ddc1395d233a3e2d.
+이번 후속 코드 SHA: f13b9c563ed30f1ddc1a68ff293fc2832348e6f3.
+누적 검토 명령: `git diff 78d68541c6653c3d74776d135463f1afd8cdfd28 f13b9c563ed30f1ddc1a68ff293fc2832348e6f3 --`.
+이전 구현 이후 코드 변경은 scripts/verify_calibration.py와 tests/test_verify_calibration.py뿐이다.
+
+조율자가 사용자 결정으로 명세를 버전 2로 기록·커밋한 뒤 dev-implement 역할로 R-2를 직접 수정했다.
+run_scenario의 `submission["sql"]`을 `submission.get("sql")`로 바꿨다.
+SQL 키 생략과 명시적인 null은 단계 GT SQL을 사용하며, 직접 지정한 SQL은 그대로 제출한다.
+R-1의 설정 전달·서비스 확인·compose 코드는 수정하지 않았다.
+
+tests/test_verify_calibration.py에 가짜 문제·가짜 SQL과 모의 HTTP를 사용하는 3개 회귀 테스트를 추가했다.
+실제 설정 validator를 통과한 생략·null·직접 지정 각각을 Phase 1/2에서 실행해
+제출 SQL과 초기화→제출→정리 요청, 결과 기록을 확인한다. private 설정·GT·실제 DB를 읽지 않는다.
+
+| 검증 | 코드 조건 | 결과 |
+| --- | --- | --- |
+| 신규 테스트 최초 실행 | 임시 파일을 사용한 테스트 초안 | 샌드박스 임시 디렉터리 쓰기 권한 오류. 제품 오류 재현 결과로 사용하지 않았다. 테스트를 메모리 모의 파일로 변경했다. |
+| `python -m unittest discover -s tests -p test_verify_calibration.py -v` 수정 전 | 실제 run_scenario는 기존 코드, 신규 회귀 테스트 | 생략 입력에서 Phase 1/2 각각 KeyError('sql') 재현. null·직접 지정은 통과. |
+| 같은 명령 수정 후 | f13b9c5와 같은 코드·테스트 내용 | 3 tests OK, 6개 입력/단계 조합 확인, exit 0. |
+| `.\.venv\Scripts\python.exe -m unittest discover -s tests -v` | f13b9c5와 같은 코드·테스트 내용, Windows/Python 3.12 | 65 tests OK, exit 0. 기존 62개 + 신규 3개. 기존 테스트가 사용하는 로컬 소켓·임시 파일 권한을 위해 자동 승인된 샌드박스 외 실행. |
+| `git diff --check`와 staged diff 확인 | 코드·테스트 후속 커밋 직전 | 공백 오류 없음. staged 파일은 수정 실행기와 신규 테스트 2개뿐. |
+| 코드 커밋 후 `git diff HEAD -- scripts/verify_calibration.py tests/test_verify_calibration.py` | f13b9c563ed30f1ddc1a68ff293fc2832348e6f3 | 출력 없음. 검증한 내용과 코드 커밋이 일치한다. |
+
+검증 시 실제 모델 API·실제 DB 평가는 호출하지 않았다. 기존 보정 30/30 실제 검증은
+아래 최초 구현 SHA와 버전 1 독립 리뷰에 대한 역사적 근거이며 새 SHA에서 재평가했다고 주장하지 않는다.
+wrapper·보정 데이터·GT·테스트 본문은 이번 수정에서 변경하지 않았다.
+
+지적 처리:
+
+- R-2: 첫 수정, 위 후속 코드 커밋과 회귀 검증으로 구현 수정 완료. 독립 재검토는 미실시.
+- R-1: 사용자 요청으로 이번 수정에서 보류. 사용자 지정 설정을 준비·생성·검증에 일관되게 전달하지 못하는 결함은 남는다.
+  현재 기본 설정 검증에 범위를 한정하고 다른 ConfigPath의 적용 신뢰성을 보장하지 않는다.
+
+수정 시작 시 다른 사용자 코드 변경은 없었다. 기존 미추적 review.md는 원래 내용 그대로 보존하고 커밋에서 제외했다.
+이번 구현자 판정은 ready_for_review이며 새 독립 리뷰 pass를 작성한 것은 아니다.
+
+아래 절은 명세 버전 1·최초 구현 SHA의 기록이다. 현재 검토 대상은 위 후속 코드 SHA와 명세 버전 2다.
+
+## 최초 구현 커밋과 검토 범위
 
 기준 커밋: 78d68541c6653c3d74776d135463f1afd8cdfd28
 코드 커밋: 377db5550bb5a32ec74d6463ddc1395d233a3e2d
@@ -74,7 +118,7 @@ virtual_M_4 실측 근거(2026-10-14): 초기 `fans` 993행, Phase 1이 고유 1
 | `python scripts\build_calibrated_set.py` (반복) | 원본 30문제 + private 설정 | 출력 해시 동일, 변경 1건(`, 0` 제거, 361→358자) | AC-5, `changed_tasks=["cross_db_M_5"]` |
 | 필드 단위 비교(원본 vs 보정 30행) | 전체 필드 순회 | 차이 1곳, 나머지 행 동일 객체 | GT 3건·타 26문제 불변 확인 |
 | `docker compose ... -f compose.benchmark.yml up` | 기본 스택 복귀 | `/calibration` 404, 원본 4문제 실패 재현 | 기본 실행 보존 |
-| `git -C vendor/BIRD-Interact/BIRD-Interact-ADK status --short` / `rev-parse HEAD` | 검증 후 | 변경 없음, `451fe2c3518ee1cf908d8139e2913483bd519481` | vendor 코드 수정 없음 |
+| `git -C vendor/BIRD-Interact/BIRD-Interact-ADK status --short` / `rev-parse HEAD` | 검증 후 | 변경 없음, `451fe2c3518ee1cf908d8139e2913483bd519381` | vendor 코드 수정 없음 (후속 보고서에서 SHA 오기 정정) |
 
 확인한 버전과 해시:
 
