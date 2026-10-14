@@ -61,6 +61,10 @@ Windows PowerShell, Python 3.12, Git, Docker Desktop의 Linux 컨테이너 환�
 - `tests/`: API 계약과 개발 세트 선택 검증.
 - `docs/`: 환경 준비와 프로젝트 문서.
 
+프로젝트 개발을 위한 조율자·구현자·리뷰어의 역할 문서와 새 채팅 시작 메시지는
+[역할별 개발 운영](docs/agent/README.md)에 있다.
+구현자가 로컬 커밋을 만들고 리뷰어가 기준 SHA와 구현 SHA의 diff를 검토하는 수동 흐름이다.
+
 세션은 `(mode, task_id)`별로 메모리에 보관하므로 Uvicorn worker는 **1개**로 실행한다.
 한 worker에서도 비동기 요청으로 여러 문제를 처리한다. 같은 세션의 실행은 lock으로 보호한다.
 공식 제출 응답으로 점수와 완료 여부를 기록하며, 연결 오류를 정상적인 0점으로 취급하지 않는다.
