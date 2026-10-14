@@ -3,10 +3,27 @@
 이 문서는 프로젝트를 개발하는 조율자·구현자·리뷰어의 수동 협업 규칙이다.
 BIRD 문제를 푸는 `agent/loop.py`의 실행 역할과는 별개다.
 
-공통 배경은 [프로젝트 개요](project.md), 각 역할의 지침은
-[조율자](roles/coordinator.md), [구현자](roles/implementer.md),
-[리뷰어](roles/reviewer.md)에 있다. 새 채팅에서는 아래처럼 해당 파일을 읽도록 요청한다.
-일반 Markdown 문서는 자동으로 적용된다고 가정하지 않는다.
+공통 지침은 프로젝트 루트의 [AGENTS.md](../../AGENTS.md)에 두며 Codex가 작업 시작 시 읽는다.
+이 지침은 [프로젝트 개요](project.md)를 읽도록 요청한다. `project.md` 자체나 Markdown 링크의
+내용이 자동으로 프롬프트에 포함되는 것은 아니다.
+
+각 역할은 `.agents/skills/`의 `dev-coordinate`, `dev-implement`, `dev-review`로 등록한다.
+Codex는 Skill의 이름·설명을 발견하고, 사용 시 해당 `SKILL.md`의 본문을 읽는다.
+각 Skill은 공통 배경과 선택한 역할의 상세 문서·템플릿을 읽도록 지시한다.
+새 채팅에서는 아래처럼 Skill 이름과 작업 자료를 지정한다. 역할 선택을 확실히 하려면
+`$dev-implement`처럼 명시적으로 호출한다.
+
+| 자료 | 읽는 방식 |
+| --- | --- |
+| 루트 `AGENTS.md` | 프로젝트 작업 시작 시 자동 지침 로드 |
+| `docs/agent/project.md` | `AGENTS.md`와 선택한 Skill의 지시에 따라 읽음 |
+| `.agents/skills/<역할>/SKILL.md` | 발견된 Skill이 선택·호출될 때 본문 로드 |
+| `docs/agent/roles/*.md` | 선택한 Skill이 해당 역할 파일만 읽음 |
+| 작업 명세·보고서 | 사용자 메시지에서 작업 ID와 경로 지정 |
+
+Skill 추가가 새 채팅이나 자동 메시지 전달을 만들지는 않는다.
+현재 열려 있는 채팅이 새 공통 지침을 이미 로드했다고 가정하지 않는다.
+새 채팅에서 시작하고, Skill 목록에 나타나지 않으면 Codex를 재시작한 뒤 확인한다.
 
 ## 한 작업의 흐름
 
@@ -65,7 +82,7 @@ git diff BASE_SHA CODE_SHA --
 조율자:
 
 ```text
-docs/agent/project.md와 docs/agent/roles/coordinator.md를 읽고 조율자로 작업해줘.
+$dev-coordinate
 작업 ID: TASK-001
 요청: <원하는 결과>
 제약: <유지할 동작>
@@ -76,7 +93,7 @@ docs/agent/project.md와 docs/agent/roles/coordinator.md를 읽고 조율자로 
 구현자:
 
 ```text
-docs/agent/project.md와 docs/agent/roles/implementer.md를 읽고 구현자로 작업해줘.
+$dev-implement
 명세: docs/agent/tasks/TASK-001/spec.md
 구현·검증 후 코드와 테스트를 로컬 커밋해줘.
 코드 SHA와 결과를 docs/agent/tasks/TASK-001/implementation.md에 기록해줘.
@@ -85,7 +102,7 @@ docs/agent/project.md와 docs/agent/roles/implementer.md를 읽고 구현자로 
 리뷰어:
 
 ```text
-docs/agent/project.md와 docs/agent/roles/reviewer.md를 읽고 독립적으로 검토해줘.
+$dev-review
 명세: docs/agent/tasks/TASK-001/spec.md
 구현 보고서: docs/agent/tasks/TASK-001/implementation.md
 보고서의 기준 SHA와 코드 SHA 사이 diff를 검토하고 필요한 검증을 실행해줘.
@@ -102,5 +119,11 @@ docs/agent/project.md와 docs/agent/roles/reviewer.md를 읽고 독립적으로 
 - 검토된 코드 SHA와 최종 결과가 일치하는가?
 - 사용자가 직접 확인하고 결정할 근거가 있었는가?
 
-막힌 지점을 확인한 뒤 필요한 필드만 추가한다. 현재 단계에서는 역할 문서를 사용하고,
-반복 사용이 안정되면 프로젝트 공통 지침과 역할별 Skill로 옮길 수 있다.
+막힌 지점을 확인한 뒤 필요한 필드만 추가한다. 역할 지침·템플릿은 `docs/agent/roles/`에
+한 번만 유지하고 Skill은 그 문서를 읽는 진입점으로 사용한다.
+
+일반 Markdown을 직접 읽도록 요청하는 방식도 계속 사용할 수 있다.
+Skill은 별도 모델·프로세스가 아니라 역할 지침과 자료를 불러오는 재사용 가능한 절차다.
+
+공식 기준: [AGENTS.md](https://learn.chatgpt.com/docs/agent-configuration/agents-md),
+[Skills](https://learn.chatgpt.com/docs/build-skills).

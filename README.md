@@ -61,7 +61,8 @@ Windows PowerShell, Python 3.12, Git, Docker Desktop의 Linux 컨테이너 환�
 - `tests/`: API 계약과 개발 세트 선택 검증.
 - `docs/`: 환경 준비와 프로젝트 문서.
 
-프로젝트 개발을 위한 조율자·구현자·리뷰어의 역할 문서와 새 채팅 시작 메시지는
+프로젝트 개발 공통 지침은 [AGENTS.md](AGENTS.md), 조율자·구현자·리뷰어의 Skill은
+`.agents/skills/`에 있다. 역할 문서와 새 채팅 시작 메시지는
 [역할별 개발 운영](docs/agent/README.md)에 있다.
 구현자가 로컬 커밋을 만들고 리뷰어가 기준 SHA와 구현 SHA의 diff를 검토하는 수동 흐름이다.
 
