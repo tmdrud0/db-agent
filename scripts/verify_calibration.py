@@ -65,7 +65,7 @@ def run_scenario(client: httpx.Client, scenario: dict, task: dict) -> list[dict]
     }).raise_for_status()
     try:
         for submission in scenario["submissions"]:
-            sql = submission["sql"] or phase_sql(task, submission["phase"])
+            sql = submission.get("sql") or phase_sql(task, submission["phase"])
             response = client.post("/submit", json={"task_id": task_id, "sql": sql})
             response.raise_for_status()
             payload = response.json()
