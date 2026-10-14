@@ -11,7 +11,8 @@ Linux 컨테이너 엔진이다. Phase 1 문제를 Command Code의 DeepSeek V4.1
 
 - 엔드포인트: `POST https://api.commandcode.ai/provider/v1/chat/completions`
 - 모델: `deepseek/deepseek-v4.1-flash`
-- 요청: `Authorization: Bearer <키>`, 비스트리밍, timeout 120초, 최대 출력 토큰 2048
+- 요청: `Authorization: Bearer <키>`, 비스트리밍, timeout 300초, 최대 출력 토큰 16384
+  (추론 토큰이 상한을 먼저 소모하므로 작은 상한은 SQL 생성 전에 잘릴 수 있다)
 
 키는 [Command Code Studio의 API keys](https://commandcode.ai/settings/keys)에서 만든다.
 평가를 실행할 PowerShell 세션에서 설정한다.

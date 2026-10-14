@@ -8,8 +8,10 @@ import httpx
 
 API_URL = "https://api.commandcode.ai/provider/v1/chat/completions"
 MODEL_ID = "deepseek/deepseek-v4.1-flash"
-REQUEST_TIMEOUT_SECONDS = 120.0
-MAX_OUTPUT_TOKENS = 2048
+REQUEST_TIMEOUT_SECONDS = 300.0
+# The model spends reasoning tokens before writing SQL, so a small cap can
+# truncate the answer before any SQL is produced.
+MAX_OUTPUT_TOKENS = 16384
 
 SYSTEM_PROMPT = (
     "You answer PostgreSQL questions for a benchmark. "
