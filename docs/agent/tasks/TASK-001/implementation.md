@@ -153,6 +153,19 @@ state·결과·오류·로그·보고서에 남기지 않았다(모의 테스트
    - 오답 유형: SQL 실행 오류 28건(존재하지 않는 테이블 추정), 실행 후 테스트 실패 2건,
      타임아웃 0건. 스키마 탐색 도구가 없는 기준선의 예상된 결과이며 정답률 목표는 두지 않았다.
    - 이 수치는 기준선의 첫 측정값이다. Phase 2 점수는 이 기준선의 개선 지표로 쓰지 않는다.
+3. oracle Phase 2 실패 4건의 원인(`dev30_oracle`): 공식 oracle 경로는 GT SQL만 제출하고 자체
+   에이전트·모델 코드를 쓰지 않는다. 같은 4개 문제를 공식 경로로 다시 실행해 확인한 결과 모두
+   Phase 1은 통과(0.7)하고 Phase 2에서만 실패했으며, 유형은 세 가지다.
+   - 객체 재생성 2건: 후속 GT SQL이 1단계 GT SQL과 같은 객체를 다시 만든다. 채점기 오류 메시지의
+     객체 이름(`hist_sign_rating_check`, `idx_users_user_preferences_interests`)이 두 단계 SQL에
+     모두 등장한다. 공식 채점기는 Phase 1 통과 SQL을 적용한 상태를 Phase 2 스냅숏으로 쓰므로
+     같은 객체를 다시 생성하는 후속 GT는 그 상태에서 실행될 수 없다(`constraint ... already exists`,
+     `relation ... already exists`).
+   - 후속 GT SQL 자체 오류 1건(`cross_db_M_5`): `operator does not exist: numeric / record` 타입 오류.
+   - 실행 후 비교 불일치 1건(`virtual_M_4`): 실행은 되지만 후속 테스트 케이스에서 `Your SQL is not correct.`
+   원본 GT·채점기를 수정하지 않았다. 이 4건은 이전 빈 SQL 기준선의 2026-10-14 실행에서도 같은 ID로
+   나타났다. 따라서 이 30문제의 Phase 2 기준 상한은 26/30(평균 0.96), Phase 1 상한은 30/30이며,
+   Phase 1만 수행하는 이번 기준선의 결과 해석에는 영향이 없다.
 
 ## 미검증 항목과 제한
 
