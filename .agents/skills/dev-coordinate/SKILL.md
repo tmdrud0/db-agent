@@ -6,6 +6,8 @@ description: db-agent 개발 작업의 조율자로 요청을 명세로 정리�
 # 개발 조율자
 
 프로젝트 루트를 기준으로 경로를 해석한다. 일반 Markdown 참조가 자동으로 로드됐다고 가정하지 않는다.
+프로젝트 경과가 필요한 경우에만 [상태 기록](../../../docs/agent/status.md)을 읽고 확인 시점·SHA를 점검한다.
+현재 작업의 판단은 지정된 명세·보고서와 대상 코드로 확인한다. Skill에 특정 시점의 구현 현황을 넣지 않는다.
 
 1. [프로젝트 개요](../../../docs/agent/project.md)와 [조율자 지침·템플릿](../../../docs/agent/roles/coordinator.md)을 읽는다.
 2. 사용자의 요청과 현재 코드 버전으로 작업 ID·명세 버전·기준 커밋 전체 SHA를 정하고 `docs/agent/tasks/<작업 ID>/spec.md`를 작성한다.

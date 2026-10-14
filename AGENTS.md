@@ -2,10 +2,14 @@
 
 ## 프로젝트 맥락
 
-BIRD-Interact Lite로 자체 에이전트 루프를 개발·평가한다. 현재 코드는 모델 없이
-빈 SQL을 한 번 제출하는 연결 확인용 구현이다. 프로젝트 작업을 시작할 때
-`docs/agent/project.md`를 읽고 현재 코드와 해당 작업의 명세를 확인한다.
+BIRD-Interact Lite로 자체 에이전트 루프를 개발·평가한다. 프로젝트 작업을 시작할 때
+`docs/agent/project.md`의 목표·평가 관점을 읽는다.
 일반 Markdown 파일이나 링크 내용이 자동으로 프롬프트에 들어온다고 가정하지 않는다.
+
+이 파일과 `project.md`에는 오래 유지할 지침을 둔다. 구현 현황·평가 수치·설정값·
+진행 중인 작업은 넣지 않는다. 작업 상태는 해당 명세·보고서와 코드 SHA로 확인한다.
+프로젝트 진행 경과가 필요하면 `docs/agent/status.md`의 확인 시점과 기준 SHA를 확인해 읽는다.
+상태 기록을 현재 코드의 보장으로 삼지 않는다.
 
 ## 역할과 작업 자료
 
@@ -30,23 +34,12 @@ BIRD-Interact Lite로 자체 에이전트 루프를 개발·평가한다. 현재
 
 ## 코드·평가 계약
 
-세션은 `(mode, task_id)`별 메모리에 저장하므로 현재 Uvicorn worker는 1개다.
-평가 기본 동시성은 10이다. 이 조건을 변경하는 작업이면 영향과 검증을 명세에 적는다.
 공식 채점 응답으로 보상·단계 성공을 기록하고 연결 오류를 오답 0점과 구분한다.
 정답·테스트 케이스를 에이전트 입력에 넣거나 숨겨진 정보를 로컬 파일에서 우회해 읽지 않는다.
 GT, API 키, `.env`, `private/`, `results/`, `vendor/`, 가상환경과 로컬 설정을 커밋하지 않는다.
 
 ## 검증
 
-프로젝트 루트의 PowerShell에서 관련 검증을 선택한다.
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\scripts\run-smoke.ps1
-.\scripts\run-dev30.ps1
-```
-
-unittest는 모의 HTTP 계약 검증이고 실제 DB 채점과 다르다.
-평가 스크립트는 oracle 후 자체 에이전트를 실행하며 결과 파일을 갱신한다.
+변경에 맞는 검증을 선택하고 계약 테스트와 실제 DB 채점을 구분한다.
 검증한 코드 버전·명령·결과와 미검증 사항을 기록한다.
 설치·평가 준비는 `docs/setup.md`, 역할 운영은 `docs/agent/README.md`를 참고한다.
