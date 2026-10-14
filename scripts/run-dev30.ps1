@@ -13,4 +13,4 @@ $env:PYTHONUTF8 = '1'
 if ($LASTEXITCODE -ne 0) { throw 'Preparing the fixed 30-task dataset failed.' }
 
 & (Join-Path $PSScriptRoot 'run-evaluation.ps1') -DataPath $subset -Limit 30 `
-    -Concurrency $Concurrency -ResultName 'dev30' -OracleResultName 'dev30_oracle'
+    -Concurrency $Concurrency -ResultName 'deepseek_v41_flash_phase1_dev30' -OracleResultName 'dev30_oracle'
