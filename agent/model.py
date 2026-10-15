@@ -31,6 +31,15 @@ class ModelReply:
     elapsed_seconds: float
 
 
+@dataclass
+class ChatReply:
+    content: str
+    response_model: str | None
+    usage: dict | None
+    elapsed_seconds: float
+    truncated: bool
+
+
 def extract_sql(content: str) -> str:
     text = content.strip()
     if text.startswith("```") and text.endswith("```") and text.count("```") == 2:
@@ -57,13 +66,10 @@ class ModelClient:
             raise ModelError("CMD_API_KEY is not set")
         return key
 
-    async def generate_sql(self, user_prompt: str) -> ModelReply:
+    async def _complete(self, messages: list[dict]) -> ChatReply:
         payload = {
             "model": MODEL_ID,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": messages,
             "stream": False,
             "max_tokens": MAX_OUTPUT_TOKENS,
         }
@@ -88,14 +94,31 @@ class ModelClient:
         choice = choices[0]
         if not isinstance(choice, dict):
             raise ModelError("Model response contained no choices")
-        if choice.get("finish_reason") == "length":
-            raise ModelError("Model output was truncated")
         content = (choice.get("message") or {}).get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise ModelError("Model response contained no SQL")
-        return ModelReply(
-            sql=extract_sql(content),
+        return ChatReply(
+            content=content if isinstance(content, str) else "",
             response_model=data.get("model"),
             usage=data.get("usage"),
             elapsed_seconds=elapsed,
+            truncated=choice.get("finish_reason") == "length",
         )
+
+    async def generate_sql(self, user_prompt: str) -> ModelReply:
+        reply = await self._complete([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ])
+        if reply.truncated:
+            raise ModelError("Model output was truncated")
+        if not reply.content.strip():
+            raise ModelError("Model response contained no SQL")
+        return ModelReply(
+            sql=extract_sql(reply.content),
+            response_model=reply.response_model,
+            usage=reply.usage,
+            elapsed_seconds=reply.elapsed_seconds,
+        )
+
+    async def chat(self, messages: list[dict]) -> ChatReply:
+        """One non-streaming turn of a multi-message conversation."""
+        return await self._complete(messages)

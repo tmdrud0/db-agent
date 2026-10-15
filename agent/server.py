@@ -1,6 +1,7 @@
 """BIRD-compatible session endpoints. Run one Uvicorn worker on port 6000."""
 
 import asyncio
+import os
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -12,8 +13,17 @@ from pydantic import BaseModel, Field
 from agent.environment import Environment, GradingError
 from agent.loop import InputError, run
 from agent.model import MODEL_ID, ModelClient, ModelError
+from agent.tool_loop import run as run_tool_loop
 
-AGENT_NAME = "deepseek-v4.1-flash-fixed-context-two-phase"
+# Each mode is selected explicitly (AGENT_MODE or create_app) and reported by /health.
+AGENT_NAMES = {
+    "fixed": "deepseek-v4.1-flash-fixed-context-two-phase",
+    "tools": "deepseek-v4.1-flash-tool-selecting-two-phase",
+}
+DEFAULT_MODE = "fixed"
+AGENT_NAME = AGENT_NAMES[DEFAULT_MODE]
+
+RUNNERS = {"fixed": run, "tools": run_tool_loop}
 
 
 class InitRequest(BaseModel):
@@ -39,8 +49,14 @@ class Session:
 def create_app(
     environment: Environment | None = None,
     model: ModelClient | None = None,
+    mode: str | None = None,
 ) -> FastAPI:
-    app = FastAPI(title=f"BIRD custom agent: {AGENT_NAME}")
+    selected = (mode or os.getenv("AGENT_MODE") or DEFAULT_MODE).strip().lower()
+    if selected not in AGENT_NAMES:
+        raise ValueError(
+            f"Unknown agent mode '{selected}'; expected one of {', '.join(AGENT_NAMES)}"
+        )
+    app = FastAPI(title=f"BIRD custom agent: {AGENT_NAMES[selected]}")
     environment = environment or Environment()
     model = model or ModelClient()
     sessions: dict[tuple[str, str], Session] = {}
@@ -50,7 +66,8 @@ def create_app(
         return {
             "status": "healthy",
             "service": "system_agent",
-            "agent": AGENT_NAME,
+            "agent": AGENT_NAMES[selected],
+            "mode": selected,
             "model": MODEL_ID,
         }
 
@@ -80,7 +97,7 @@ def create_app(
             raise HTTPException(404, "Call /init_session first")
         async with session.lock:
             try:
-                response = await run(session.state, req.message, environment, model)
+                response = await RUNNERS[selected](session.state, req.message, environment, model)
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc
             except ModelError as exc:

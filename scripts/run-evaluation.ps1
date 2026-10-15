@@ -4,6 +4,7 @@ param(
     [string]$DataPath = '',
     [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$ResultName = 'deepseek_v41_flash_two_phase',
     [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$OracleResultName = 'oracle_smoke',
+    [ValidateSet('fixed', 'tools')][string]$AgentMode = 'fixed',
     [switch]$Calibrated
 )
 
@@ -23,8 +24,12 @@ $env:PYTHONUTF8 = '1'
 $env:DATASET = 'lite'
 $env:DB_ENV_URL = 'http://127.0.0.1:6002'
 $env:USER_SIM_URL = 'http://127.0.0.1:6001'
-# Health values reported by the intended two-phase baseline (agent/server.py).
-$agentName = 'deepseek-v4.1-flash-fixed-context-two-phase'
+# Health values reported by the selected agent mode (agent/server.py).
+$agentNames = @{
+    fixed = 'deepseek-v4.1-flash-fixed-context-two-phase'
+    tools = 'deepseek-v4.1-flash-tool-selecting-two-phase'
+}
+$agentName = $agentNames[$AgentMode]
 $modelId = 'deepseek/deepseek-v4.1-flash'
 $agentUrl = 'http://127.0.0.1:6000'
 
@@ -53,12 +58,13 @@ function Wait-Service([string]$Url) {
     throw "Service did not become ready: $Url"
 }
 
-# A reused or freshly started agent must be the intended two-phase baseline,
-# not a stale server with different model or settings.
-function Assert-BaselineAgent([string]$Url) {
+# A reused or freshly started agent must be the intended two-phase agent for
+# the requested mode, not a stale server with a different model or settings.
+function Assert-BaselineAgent([string]$Url, [string]$Mode) {
     $info = Invoke-RestMethod -Uri "$Url/health" -TimeoutSec 5
-    if ($info.service -ne 'system_agent' -or $info.agent -ne $agentName -or $info.model -ne $modelId) {
-        throw "Port 6000 is not the two-phase baseline agent ($agentName / $modelId). Stop that service before evaluation."
+    if ($info.service -ne 'system_agent' -or $info.mode -ne $Mode -or
+        $info.agent -ne $agentName -or $info.model -ne $modelId) {
+        throw "Port 6000 is not the '$Mode' two-phase agent ($agentName / $modelId). Stop that service before evaluation."
     }
 }
 
@@ -88,23 +94,24 @@ try {
     Wait-Service 'http://127.0.0.1:6001/health'
     Assert-Calibration $Calibrated
 
-    # Reuse a running agent only when it reports the intended baseline.
+    # Reuse a running agent only when it reports the requested mode.
     $existingAgent = $null
     try { $existingAgent = Invoke-RestMethod "$agentUrl/health" -TimeoutSec 2 } catch { }
     if ($existingAgent) {
-        Assert-BaselineAgent $agentUrl
+        Assert-BaselineAgent $agentUrl $AgentMode
     } else {
         Import-AgentApiKey -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
         if (-not $env:CMD_API_KEY) {
             throw 'CMD_API_KEY is missing. Set it in the project .env file or the current PowerShell environment.'
         }
+        $env:AGENT_MODE = $AgentMode
         $agentProcess = Start-Process -FilePath $pythonExe -WindowStyle Hidden -PassThru `
             -ArgumentList '-m', 'uvicorn', 'agent.server:app', '--host', '127.0.0.1', '--port', '6000' `
             -WorkingDirectory $projectRoot `
             -RedirectStandardOutput (Join-Path $runtimeDir 'agent.stdout.log') `
             -RedirectStandardError (Join-Path $runtimeDir 'agent.stderr.log')
         Wait-Service "$agentUrl/health"
-        Assert-BaselineAgent $agentUrl
+        Assert-BaselineAgent $agentUrl $AgentMode
     }
 
     Push-Location $benchmarkRoot

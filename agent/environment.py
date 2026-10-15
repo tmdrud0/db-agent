@@ -38,8 +38,10 @@ class Environment:
         except ValueError as exc:
             raise GradingError(f"{label} response was not valid JSON: {exc}") from exc
 
-    async def _fetch_information(self, path: str, field: str, label: str, task_id: str) -> str:
-        data = await self._post(self.db_url, path, {"task_id": task_id}, label)
+    async def _fetch_information(
+        self, path: str, field: str, label: str, task_id: str, **extra
+    ) -> str:
+        data = await self._post(self.db_url, path, {"task_id": task_id, **extra}, label)
         content = data.get(field)
         if not isinstance(content, str):
             raise GradingError(f"{label} response did not contain a {field} string")
@@ -53,8 +55,29 @@ class Environment:
             "/all_column_meanings", "column_meanings", "Column meanings fetch", task_id
         )
 
+    async def fetch_column_meaning(self, task_id: str, table_name: str, column_name: str) -> str:
+        return await self._fetch_information(
+            "/column_meaning", "meaning", "Column meaning fetch", task_id,
+            table_name=table_name, column_name=column_name,
+        )
+
     async def fetch_knowledge(self, task_id: str) -> str:
         return await self._fetch_information("/knowledge", "knowledge", "Knowledge fetch", task_id)
+
+    async def fetch_knowledge_names(self, task_id: str) -> list[str]:
+        data = await self._post(
+            self.db_url, "/knowledge_names", {"task_id": task_id}, "Knowledge names fetch"
+        )
+        names = data.get("names")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise GradingError("Knowledge names fetch response did not contain a list of names")
+        return names
+
+    async def fetch_knowledge_entry(self, task_id: str, knowledge_name: str) -> str:
+        return await self._fetch_information(
+            "/knowledge", "knowledge", "Knowledge entry fetch", task_id,
+            knowledge_name=knowledge_name,
+        )
 
     async def transition_to_phase2(self, task_id: str) -> None:
         data = await self._post(

@@ -13,6 +13,15 @@ from agent.model import (
     ModelError,
     ModelReply,
 )
+from agent.session import (
+    InputError,
+    budget,
+    database_line,
+    finish,
+    record_action,
+    resolve_query,
+    restore_failure,
+)
 
 INFORMATION_COST = 1.0
 SUBMIT_COST = 3.0
@@ -22,26 +31,6 @@ INFORMATION_FETCHES = (
     ("get_all_column_meanings", Environment.fetch_column_meanings),
     ("get_all_knowledge_definitions", Environment.fetch_knowledge),
 )
-
-
-class InputError(ValueError):
-    """The runner did not provide a question to answer."""
-
-
-def _budget(state: dict) -> float:
-    return float(state.get("budget_remaining", 0))
-
-
-def _resolve_query(state: dict, message: str) -> str:
-    query = str(state.get("user_query") or "").strip() or message.strip()
-    if not query:
-        raise InputError("state.user_query and the run message are both empty")
-    return query
-
-
-def _database_line(state: dict) -> str:
-    db_name = str(state.get("db_name") or "").strip()
-    return f"Database: {db_name}\n\n" if db_name else ""
 
 
 def _information_block(information: dict[str, str]) -> str:
@@ -56,7 +45,7 @@ def _information_block(information: dict[str, str]) -> str:
 
 
 def _phase1_prompt(state: dict, query: str, information: dict[str, str]) -> str:
-    return f"{_database_line(state)}User Query:\n{query}\n\n{_information_block(information)}"
+    return f"{database_line(state)}User Query:\n{query}\n\n{_information_block(information)}"
 
 
 def _phase2_prompt(
@@ -67,7 +56,7 @@ def _phase2_prompt(
     phase1_result: SubmitResult,
 ) -> str:
     return (
-        f"{_database_line(state)}Original user query:\n{query}\n\n"
+        f"{database_line(state)}Original user query:\n{query}\n\n"
         f"{_information_block(information)}\n\n"
         "Phase 1 SQL that is already applied to the database:\n"
         f"{phase1_sql}\n\n"
@@ -80,47 +69,19 @@ def _phase2_prompt(
     )
 
 
-def _restore_failure(failure: dict) -> Exception:
-    message = str(failure.get("message", "The previous attempt failed"))
-    if failure.get("stage") == "model":
-        return ModelError(message)
-    return GradingError(message)
-
-
-def _finish(state: dict, stop_reason: str, response: str) -> str:
-    state["stop_reason"] = stop_reason
-    state["loop_stopped"] = True
-    state["final_response"] = response
-    return response
-
-
-def _record_action(
-    state: dict, tool: str, args: dict, result, cost: float, budget_before: float
-) -> None:
-    state.setdefault("tool_trajectory", []).append({
-        "type": "tool",
-        "tool": tool,
-        "args": args,
-        "result": result,
-        "cost": cost,
-        "budget_before": budget_before,
-        "budget_after": state["budget_remaining"],
-    })
-
-
 async def _fetch_information(state: dict, environment: Environment, tool_name: str, fetch) -> str:
-    budget_before = _budget(state)
+    budget_before = budget(state)
     state["budget_remaining"] = budget_before - INFORMATION_COST
     try:
         content = await fetch(environment, state["task_id"])
     except GradingError as exc:
-        _record_action(
+        record_action(
             state, tool_name, {"task_id": state["task_id"]}, {"error": str(exc)},
             INFORMATION_COST, budget_before,
         )
         state["failure"] = {"stage": "information", "message": str(exc)}
         raise
-    _record_action(
+    record_action(
         state, tool_name, {"task_id": state["task_id"]}, content,
         INFORMATION_COST, budget_before,
     )
@@ -154,17 +115,17 @@ async def _model_call(state: dict, model: ModelClient, phase: int, prompt: str) 
 
 
 async def _submit(state: dict, environment: Environment, sql: str) -> SubmitResult:
-    budget_before = _budget(state)
+    budget_before = budget(state)
     state["budget_remaining"] = budget_before - SUBMIT_COST
     try:
         result = await environment.submit(state["task_id"], sql)
     except GradingError as exc:
-        _record_action(
+        record_action(
             state, "submit_sql", {"sql": sql}, {"error": str(exc)}, SUBMIT_COST, budget_before
         )
         state["failure"] = {"stage": "grader", "message": str(exc)}
         raise
-    _record_action(
+    record_action(
         state, "submit_sql", {"sql": sql}, result.model_dump(), SUBMIT_COST, budget_before
     )
     state["last_submit"] = result.model_dump()
@@ -177,27 +138,27 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
         return state["final_response"]
     # A failed attempt is never retried inside the same session.
     if state.get("failure"):
-        raise _restore_failure(state["failure"])
+        raise restore_failure(state["failure"])
 
-    query = _resolve_query(state, message)
+    query = resolve_query(state, message)
 
     # Fixed information round: each official fetch is tried once and costs one coin.
     information: dict[str, str] = {}
     for tool_name, fetch in INFORMATION_FETCHES:
-        budget = _budget(state)
-        if budget < INFORMATION_COST:
-            return _finish(
+        remaining = budget(state)
+        if remaining < INFORMATION_COST:
+            return finish(
                 state, "budget_exhausted_before_information",
-                f"Stopped before the fixed information fetches: {budget:g} bird-coins "
+                f"Stopped before the fixed information fetches: {remaining:g} bird-coins "
                 f"remaining (each fetch costs {INFORMATION_COST:g} bird-coin).",
             )
         information[tool_name] = await _fetch_information(state, environment, tool_name, fetch)
 
-    budget = _budget(state)
-    if budget < SUBMIT_COST:
-        return _finish(
+    remaining = budget(state)
+    if remaining < SUBMIT_COST:
+        return finish(
             state, "budget_exhausted_before_phase1",
-            f"Stopped before Phase 1: {budget:g} bird-coins remaining after the information "
+            f"Stopped before Phase 1: {remaining:g} bird-coins remaining after the information "
             f"fetches (a submission costs {SUBMIT_COST:g} bird-coins).",
         )
 
@@ -205,23 +166,23 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
     result = await _submit(state, environment, reply.sql)
 
     if not result.passed:
-        return _finish(state, "phase1_failed", result.message)
+        return finish(state, "phase1_failed", result.message)
 
     # Rewards come from the official responses; 0.7/0.3 are never awarded here.
     state["total_reward"] += result.reward
     state["phase1_completed"] = True
     if not result.has_follow_up:
         state["task_done"] = True
-        return _finish(state, "phase1_completed", result.message)
+        return finish(state, "phase1_completed", result.message)
 
     state["follow_up_query"] = result.follow_up_query
     state["current_phase"] = 2
 
-    budget = _budget(state)
-    if budget < SUBMIT_COST:
-        return _finish(
+    remaining = budget(state)
+    if remaining < SUBMIT_COST:
+        return finish(
             state, "budget_exhausted_before_phase2",
-            f"Phase 1 passed, but stopped before the follow-up: {budget:g} bird-coins "
+            f"Phase 1 passed, but stopped before the follow-up: {remaining:g} bird-coins "
             f"remaining (a submission costs {SUBMIT_COST:g} bird-coins).",
         )
 
@@ -241,6 +202,6 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
         state["total_reward"] += result2.reward
         state["phase2_completed"] = True
         state["task_done"] = True
-        return _finish(state, "phase2_completed", result2.message)
+        return finish(state, "phase2_completed", result2.message)
 
-    return _finish(state, "phase2_failed", result2.message)
+    return finish(state, "phase2_failed", result2.message)
