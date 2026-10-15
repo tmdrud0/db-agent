@@ -47,6 +47,17 @@ function Import-AgentApiKey([string]$PythonExe, [string]$EnvPath) {
     if ($loadedKey) { $env:CMD_API_KEY = $loadedKey }
 }
 
+# PowerShell 5.1 promotes a native command's stderr to a terminating error while
+# $ErrorActionPreference is Stop, which breaks non-interactive runs (CI, task
+# schedulers). External tools run with the preference relaxed; the exit code is
+# checked here as before.
+function Invoke-External([string]$Label, [scriptblock]$Command) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Command } finally { $ErrorActionPreference = $previous }
+    if ($LASTEXITCODE -ne 0) { throw "$Label (exit code $LASTEXITCODE)." }
+}
+
 function Wait-Service([string]$Url) {
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         try {
@@ -88,8 +99,9 @@ Push-Location $projectRoot
 try {
     $composeFiles = @('-f', 'compose.benchmark.yml')
     if ($Calibrated) { $composeFiles += @('-f', 'compose.benchmark.calibrated.yml') }
-    & docker compose -p db-agent-smoke @composeFiles up --build -d --wait --wait-timeout 900
-    if ($LASTEXITCODE -ne 0) { throw 'Benchmark containers could not start.' }
+    Invoke-External 'Benchmark containers could not start' {
+        docker compose -p db-agent-smoke @composeFiles up --build -d --wait --wait-timeout 900
+    }
     Wait-Service 'http://127.0.0.1:6002/health'
     Wait-Service 'http://127.0.0.1:6001/health'
     Assert-Calibration $Calibrated
@@ -117,9 +129,10 @@ try {
     Push-Location $benchmarkRoot
     try {
         # Positive control: original ground-truth SQL, no agent/model calls.
-        & $pythonExe -m orchestrator.runner --mode oracle --data $combinedData `
-            --limit $Limit --concurrency $Concurrency --output (Join-Path $resultsDir "$OracleResultName.json")
-        if ($LASTEXITCODE -ne 0) { throw 'Oracle runner failed.' }
+        Invoke-External 'Oracle runner failed' {
+            & $pythonExe -m orchestrator.runner --mode oracle --data $combinedData `
+                --limit $Limit --concurrency $Concurrency --output (Join-Path $resultsDir "$OracleResultName.json")
+        }
         $oracle = Get-Content -LiteralPath (Join-Path $resultsDir "$OracleResultName.json") -Raw | ConvertFrom-Json
         foreach ($task in $oracle.results) {
             if ($task.error) { throw "Oracle infrastructure error: $($task.error)" }
@@ -129,14 +142,17 @@ try {
         }
 
         # Evaluate the current custom agent using exactly the same input tasks.
-        & $pythonExe -m orchestrator.runner --mode a-interact --data $combinedData `
-            --limit $Limit --concurrency $Concurrency --output (Join-Path $resultsDir "$ResultName.json")
-        if ($LASTEXITCODE -ne 0) { throw 'Custom agent runner failed.' }
+        Invoke-External 'Custom agent runner failed' {
+            & $pythonExe -m orchestrator.runner --mode a-interact --data $combinedData `
+                --limit $Limit --concurrency $Concurrency --output (Join-Path $resultsDir "$ResultName.json")
+        }
 
-        & $pythonExe -m orchestrator.report (Join-Path $resultsDir "$OracleResultName.json")
-        if ($LASTEXITCODE -ne 0) { throw 'Oracle report generation failed.' }
-        & $pythonExe -m orchestrator.report (Join-Path $resultsDir "$ResultName.json")
-        if ($LASTEXITCODE -ne 0) { throw 'Custom agent report generation failed.' }
+        Invoke-External 'Oracle report generation failed' {
+            & $pythonExe -m orchestrator.report (Join-Path $resultsDir "$OracleResultName.json")
+        }
+        Invoke-External 'Custom agent report generation failed' {
+            & $pythonExe -m orchestrator.report (Join-Path $resultsDir "$ResultName.json")
+        }
     } finally { Pop-Location }
 
     foreach ($name in @($OracleResultName, $ResultName)) {
