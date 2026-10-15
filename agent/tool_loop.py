@@ -7,6 +7,8 @@ and ask_user are neither offered nor executed. Phase transitions after a
 passing Phase 1 submission stay under code control.
 """
 
+import asyncio
+import re
 import time
 
 from agent.environment import Environment, GradingError
@@ -31,6 +33,43 @@ from agent.tools import ALLOWED_TOOLS, SUBMIT_COST, ActionError, catalog, parse_
 
 MAX_MODEL_ACTIONS = 24
 SESSION_TIME_LIMIT_SECONDS = 1500.0
+
+SQL_WHITESPACE = " \t\n\r\f\v"
+DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+class SessionExpired(RuntimeError):
+    """The session time limit was reached, so no new call may start."""
+
+
+def _limit_text() -> str:
+    return f"the {SESSION_TIME_LIMIT_SECONDS:.0f}-second session limit"
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _remaining(deadline: float) -> float:
+    return deadline - _now()
+
+
+async def _bounded(awaitable, remaining: float, label: str):
+    """Await one external call inside the session deadline.
+
+    The wait is capped so an in-flight model or service request cannot push the
+    session past its limit. Cancelling stops our wait only: a request the
+    official service already received is not rolled back, so callers record the
+    interrupted action as an unknown outcome instead of a result.
+    """
+    try:
+        return await asyncio.wait_for(awaitable, timeout=remaining)
+    except asyncio.TimeoutError as exc:
+        raise SessionExpired(
+            f"{_limit_text()} was reached while waiting for {label}; the call was cancelled "
+            "and its outcome is unknown"
+        ) from exc
+
 
 SYSTEM_PROMPT = (
     "You solve PostgreSQL tasks for a benchmark by choosing exactly one action per turn.\n"
@@ -90,14 +129,104 @@ def _model_actions(state: dict) -> int:
     return sum(1 for event in state.get("adk_events", []) if event.get("type") == "model_call")
 
 
-def _normalize_sql(sql: str) -> str:
-    return " ".join(sql.split())
+def _quoted_span(text: str, start: int, quote: str, allow_escapes: bool) -> tuple[str, int] | None:
+    """Return one quoted region verbatim, or None when its extent is ambiguous."""
+    index = start + 1
+    while index < len(text):
+        if text[index] == "\\" and allow_escapes:
+            return None
+        if text[index] == quote:
+            if index + 1 < len(text) and text[index + 1] == quote:
+                index += 2
+                continue
+            return text[start:index + 1], index + 1
+        index += 1
+    return None
+
+
+def _dollar_span(text: str, start: int) -> tuple[str, int] | None:
+    match = DOLLAR_QUOTE.match(text, start)
+    if match is None:
+        return None
+    end = text.find(match.group(0), match.end())
+    if end == -1:
+        return None
+    end += len(match.group(0))
+    return text[start:end], end
+
+
+def _block_comment_end(text: str, start: int) -> int | None:
+    depth = 0
+    index = start
+    while index < len(text):
+        if text.startswith("/*", index):
+            depth += 1
+            index += 2
+        elif text.startswith("*/", index):
+            depth -= 1
+            index += 2
+            if depth == 0:
+                return index
+        else:
+            index += 1
+    return None
+
+
+def submission_key(sql: str) -> str:
+    """The duplicate key of one submission.
+
+    Whitespace between tokens is collapsed, but the text inside string literals,
+    quoted identifiers, dollar-quoted bodies and comments is preserved exactly:
+    SQL that differs only there means something different, and blocking it would
+    keep a corrected statement away from the official grader. Regions whose
+    extent cannot be decided safely (escape strings, unbalanced quotes or
+    comments) fall back to the unchanged text, which only narrows the check.
+    """
+    text = sql.strip()
+    parts: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in SQL_WHITESPACE:
+            while index < len(text) and text[index] in SQL_WHITESPACE:
+                index += 1
+            parts.append(" ")
+            continue
+        if char in "'\"":
+            span = _quoted_span(text, index, char, allow_escapes=char == "'")
+            if span is None:
+                return text
+            parts.append(span[0])
+            index = span[1]
+            continue
+        if char == "$":
+            span = _dollar_span(text, index)
+            if span is not None:
+                parts.append(span[0])
+                index = span[1]
+                continue
+        elif text.startswith("--", index):
+            end = text.find("\n", index)
+            end = len(text) if end == -1 else end + 1
+            parts.append(text[index:end])
+            index = end
+            continue
+        elif text.startswith("/*", index):
+            end = _block_comment_end(text, index)
+            if end is None:
+                return text
+            parts.append(text[index:end])
+            index = end
+            continue
+        parts.append(char)
+        index += 1
+    return "".join(parts).strip()
 
 
 def _is_duplicate_submission(state: dict, sql: str, phase: int) -> bool:
-    normalized = _normalize_sql(sql)
+    key = submission_key(sql)
     return any(
-        attempt["phase"] == phase and attempt["sql"] == normalized
+        attempt["phase"] == phase and submission_key(attempt["sql"]) == key
         for attempt in state.get("submit_attempts", [])
     )
 
@@ -114,10 +243,10 @@ def _cached_result(state: dict, name: str, args: dict) -> str | None:
 
 
 async def _model_call(
-    state: dict, model: ModelClient, phase: int, messages: list[dict]
+    state: dict, model: ModelClient, phase: int, messages: list[dict], deadline: float
 ) -> tuple[ChatReply, dict]:
     try:
-        reply = await model.chat(messages)
+        reply = await _bounded(model.chat(messages), _remaining(deadline), "the model response")
     except ModelError as exc:
         state["failure"] = {"stage": "model", "message": str(exc)}
         raise
@@ -144,7 +273,7 @@ async def _model_call(
 
 
 async def _information(
-    state: dict, environment: Environment, name: str, args: dict, phase: int
+    state: dict, environment: Environment, name: str, args: dict, phase: int, deadline: float
 ) -> str:
     spec = ALLOWED_TOOLS[name]
     budget_before = budget(state)
@@ -157,9 +286,18 @@ async def _information(
             phase=phase, cached=True,
         )
         return f"Served from the session cache; the same request was already made.\n{cached}"
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        raise SessionExpired(f"{_limit_text()} was reached before {name} could start")
     state["budget_remaining"] = budget_before - spec.cost
     try:
-        content = await spec.run(environment, state["task_id"], args)
+        content = await _bounded(spec.run(environment, state["task_id"], args), remaining, name)
+    except SessionExpired as exc:
+        record_action(
+            state, name, args, {"error": str(exc)}, spec.cost, budget_before,
+            phase=phase, timed_out=True,
+        )
+        raise
     except GradingError as exc:
         record_action(
             state, name, args, {"error": str(exc)}, spec.cost, budget_before, phase=phase
@@ -171,7 +309,13 @@ async def _information(
 
 
 async def _submit_action(
-    state: dict, environment: Environment, sql: str, phase: int, messages: list[dict], index: int
+    state: dict,
+    environment: Environment,
+    sql: str,
+    phase: int,
+    messages: list[dict],
+    index: int,
+    deadline: float,
 ) -> tuple[str, str] | None:
     """Submit, or report a blocked duplicate. Returns the stop reason when the task ends."""
     budget_before = budget(state)
@@ -190,9 +334,22 @@ async def _submit_action(
         })
         return None
 
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        raise SessionExpired(f"{_limit_text()} was reached before the submission could start")
     state["budget_remaining"] = budget_before - SUBMIT_COST
     try:
-        result = await environment.submit(state["task_id"], sql)
+        result = await _bounded(
+            environment.submit(state["task_id"], sql), remaining, "the submission"
+        )
+    except SessionExpired as exc:
+        # The grader may already have received the statement, so this is recorded as an
+        # unknown outcome instead of a failure or a pass.
+        record_action(
+            state, "submit_sql", {"sql": sql}, {"error": str(exc)}, SUBMIT_COST, budget_before,
+            phase=phase, timed_out=True,
+        )
+        raise
     except GradingError as exc:
         record_action(
             state, "submit_sql", {"sql": sql}, {"error": str(exc)}, SUBMIT_COST, budget_before,
@@ -205,7 +362,7 @@ async def _submit_action(
         phase=phase,
     )
     state["last_submit"] = result.model_dump()
-    state.setdefault("submit_attempts", []).append({"phase": phase, "sql": _normalize_sql(sql)})
+    state.setdefault("submit_attempts", []).append({"phase": phase, "sql": sql})
 
     if not result.passed:
         messages.append({
@@ -225,10 +382,21 @@ async def _submit_action(
         state["current_phase"] = 2
         # The official user simulator switches to the follow-up reference exactly once.
         try:
-            await environment.transition_to_phase2(state["task_id"])
+            remaining = _remaining(deadline)
+            if remaining <= 0:
+                raise SessionExpired(
+                    f"{_limit_text()} was reached before the phase transition could start"
+                )
+            await _bounded(
+                environment.transition_to_phase2(state["task_id"]), remaining, "the phase transition"
+            )
+        except SessionExpired as exc:
+            state["phase_transition"] = {"completed": False, "message": str(exc)}
+            raise
         except GradingError as exc:
             state["failure"] = {"stage": "transition", "message": str(exc)}
             raise
+        state["phase_transition"] = {"completed": True}
         body = (
             f"{result.message}\nThe phase 1 SQL is applied to the database.\n"
             f"Follow-up question:\n{result.follow_up_query or ''}"
@@ -254,6 +422,7 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
 
     query = resolve_query(state, message)
     started = _now()
+    deadline = started + SESSION_TIME_LIMIT_SECONDS
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": _initial_prompt(state, query)},
@@ -271,11 +440,10 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
                 "action_limit_reached",
                 f"Stopped after {MAX_MODEL_ACTIONS} model actions. {_outcome(state)}",
             )
-        if _now() - started >= SESSION_TIME_LIMIT_SECONDS:
+        if _remaining(deadline) <= 0:
             return stop(
                 "session_time_limit",
-                f"Stopped after the {SESSION_TIME_LIMIT_SECONDS:.0f}-second session limit. "
-                f"{_outcome(state)}",
+                f"Stopped after {_limit_text()}. {_outcome(state)}",
             )
         # A submission is the only action that completes the task and it is the most
         # expensive one, so a budget below its price cannot end the session successfully.
@@ -286,8 +454,18 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
                 f"{SUBMIT_COST:g}. {_outcome(state)}",
             )
 
-        reply, event = await _model_call(state, model, phase, messages)
+        try:
+            reply, event = await _model_call(state, model, phase, messages, deadline)
+        except SessionExpired as exc:
+            return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
         messages.append({"role": "assistant", "content": reply.content})
+        # The response may have arrived right at the limit; nothing is executed after it.
+        if _remaining(deadline) <= 0:
+            return stop(
+                "session_time_limit",
+                f"Stopped: {_limit_text()} was reached after the model response, so the action "
+                f"was not executed. {_outcome(state)}",
+            )
         try:
             name, args = parse_action(reply.content)
         except ActionError as exc:
@@ -303,13 +481,18 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
             continue
         event["action"] = {"name": name, "args": args}
 
-        if name == "submit_sql":
-            outcome = await _submit_action(state, environment, args["sql"], phase, messages, index)
-            if outcome is not None:
-                return stop(*outcome)
-            continue
+        try:
+            if name == "submit_sql":
+                outcome = await _submit_action(
+                    state, environment, args["sql"], phase, messages, index, deadline
+                )
+                if outcome is not None:
+                    return stop(*outcome)
+                continue
 
-        content = await _information(state, environment, name, args, phase)
+            content = await _information(state, environment, name, args, phase, deadline)
+        except SessionExpired as exc:
+            return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
         messages.append({
             "role": "user",
             "content": _observation(index, phase, name, ALLOWED_TOOLS[name].cost, state, content),

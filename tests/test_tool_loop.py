@@ -13,7 +13,7 @@ from agent import tool_loop
 from agent.environment import Environment, GradingError
 from agent.model import API_URL, MAX_OUTPUT_TOKENS, MODEL_ID, ModelClient, ModelError
 from agent.server import AGENT_NAMES, create_app
-from agent.tool_loop import MAX_MODEL_ACTIONS
+from agent.tool_loop import MAX_MODEL_ACTIONS, submission_key
 from agent.tools import ALLOWED_TOOLS, SUBMIT_COST, TOOL_COSTS, ActionError, parse_action
 
 SCHEMA_TEXT = "CREATE TABLE customers (\n  id integer,\n  name text\n);"
@@ -61,6 +61,76 @@ def model_reply(content: str, finish_reason: str = "stop") -> dict:
         "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
     }
+
+
+class FakeClock:
+    """A monotonic clock the tests move to check the session deadline."""
+
+    def __init__(self, value: float = 0.0):
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class SubmissionKeyTests(unittest.TestCase):
+    """R-1: the duplicate key keeps SQL that means something different apart."""
+
+    def test_whitespace_between_tokens_is_normalized(self):
+        self.assertEqual(submission_key("  SELECT 1; \n"), "SELECT 1;")
+        self.assertEqual(
+            submission_key("SELECT   a,\n\t b  FROM t;"), submission_key("SELECT a, b FROM t;")
+        )
+
+    def test_string_literal_and_quoted_identifier_content_is_preserved(self):
+        self.assertNotEqual(submission_key("SELECT 'a  b';"), submission_key("SELECT 'a b';"))
+        self.assertNotEqual(
+            submission_key("SELECT 'it''s  ok';"), submission_key("SELECT 'it''s ok';")
+        )
+        self.assertNotEqual(
+            submission_key('SELECT "a  b" FROM t;'), submission_key('SELECT "a b" FROM t;')
+        )
+        self.assertEqual(
+            submission_key("SELECT  'a  b'   AS x;"), submission_key("SELECT 'a  b' AS x;")
+        )
+
+    def test_comment_text_and_line_breaks_are_preserved(self):
+        self.assertNotEqual(
+            submission_key("SELECT 1; -- a\nb"), submission_key("SELECT 1; -- a b")
+        )
+        self.assertEqual(
+            submission_key("SELECT 1; -- a\nSELECT 2;"), submission_key("SELECT 1;   -- a\nSELECT 2;")
+        )
+        self.assertNotEqual(
+            submission_key("SELECT /* a  b */ 1;"), submission_key("SELECT /* a b */ 1;")
+        )
+        self.assertEqual(
+            submission_key("SELECT   /* a b */   1;"), submission_key("SELECT /* a b */ 1;")
+        )
+        self.assertNotEqual(
+            submission_key("SELECT /* a\nb */ 1;"), submission_key("SELECT /* a b */ 1;")
+        )
+
+    def test_dollar_quoted_bodies_are_preserved(self):
+        self.assertNotEqual(submission_key("SELECT $$a  b$$;"), submission_key("SELECT $$a b$$;"))
+        self.assertNotEqual(
+            submission_key("SELECT $tag$a  b$tag$;"), submission_key("SELECT $tag$a b$tag$;")
+        )
+        self.assertEqual(
+            submission_key("SELECT 1 WHERE x = $1;"), "SELECT 1 WHERE x = $1;"
+        )
+        self.assertEqual(
+            submission_key("SELECT  1  WHERE  x = $1;"), submission_key("SELECT 1 WHERE x = $1;")
+        )
+
+    def test_ambiguous_escaping_or_unbalanced_text_falls_back_to_exact_matching(self):
+        escaped = "SELECT E'a\\'b';"
+        self.assertEqual(submission_key(escaped), escaped)
+        self.assertNotEqual(submission_key(f"SELECT  {escaped}"), submission_key(escaped))
+        for text in ("SELECT 'unterminated", 'SELECT "unterminated', "SELECT /* unterminated"):
+            with self.subTest(text=text):
+                self.assertEqual(submission_key(text), text)
+        self.assertEqual(submission_key("SELECT /* a /* b */ c */ 1;"), "SELECT /* a /* b */ c */ 1;")
 
 
 class ActionParsingTests(unittest.TestCase):
@@ -139,6 +209,8 @@ class ToolLoopTestCase(unittest.TestCase):
         self.grader_status = 200
         self.transition_status = 200
         self.info_payloads = {}
+        self.on_model_call = None
+        self.on_service_call = None
         self.state = {
             "task_id": "test-task", "db_name": "demo", "user_query": "How many customers?",
             "budget_remaining": 18, "initial_budget": 18,
@@ -153,6 +225,8 @@ class ToolLoopTestCase(unittest.TestCase):
         path = request.url.path
         payload = json.loads(request.content)
         self.service_requests.append((path, payload))
+        if self.on_service_call is not None:
+            self.on_service_call(path)
         if path == "/submit":
             if self.grader_status != 200:
                 return httpx.Response(self.grader_status, json={"error": {"message": "boom"}})
@@ -178,6 +252,8 @@ class ToolLoopTestCase(unittest.TestCase):
 
     def model_handler(self, request):
         self.model_requests.append(json.loads(request.content))
+        if self.on_model_call is not None:
+            self.on_model_call()
         if not self.actions:
             raise AssertionError("The loop asked for a model action the script does not provide")
         scripted = self.actions.pop(0)
@@ -369,6 +445,51 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertEqual(state["adk_events"][1]["action"]["args"]["sql"],
                          "SELECT count(id) FROM customers;")
 
+    def test_duplicate_key_keeps_meaningful_sql_changes_submittable(self):
+        cases = {
+            "different string literal": (
+                "SELECT count(*) FROM customers WHERE name = 'a  b';",
+                "SELECT count(*) FROM customers WHERE name = 'a b';",
+            ),
+            "different line comment": (
+                "SELECT count(*) FROM customers; -- first  note",
+                "SELECT count(*) FROM customers; -- first note",
+            ),
+        }
+        for name, (first, revised) in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                final = "SELECT count(*) FROM customers;"
+                self.actions = [
+                    action("submit_sql", sql=first),
+                    action("submit_sql", sql=revised),
+                    action("submit_sql", sql=revised),
+                    action("submit_sql", sql=final),
+                ]
+                self.grader_payloads = [
+                    dict(GRADER_FAILURE), dict(GRADER_FAILURE), dict(PHASE1_FINAL),
+                ]
+                state = self.run_ok()
+
+                self.assertEqual(
+                    [payload["sql"] for path, payload in self.service_requests if path == "/submit"],
+                    [first, revised, final],
+                )
+                self.assertEqual(state["total_reward"], 0.7)
+                self.assertTrue(state["task_done"])
+                self.assertEqual(state["stop_reason"], "phase1_completed")
+                self.assertEqual(
+                    [(entry["tool"], entry["cost"]) for entry in state["tool_trajectory"]],
+                    [("submit_sql", 3.0), ("submit_sql", 3.0), ("submit_sql", 0.0),
+                     ("submit_sql", 3.0)],
+                )
+                self.assertEqual(state["tool_trajectory"][2]["blocked"], "duplicate_sql")
+                self.assertEqual(state["submit_attempts"], [
+                    {"phase": 1, "sql": first},
+                    {"phase": 1, "sql": revised},
+                    {"phase": 1, "sql": final},
+                ])
+
     def test_duplicate_sql_is_blocked_per_phase_without_a_charge(self):
         first = "SELECT 1;"
         second = "SELECT 2;"
@@ -499,15 +620,35 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertIn(str(MAX_MODEL_ACTIONS), state["final_response"])
         self.assertIn("Phase 1 is incomplete", state["final_response"])
 
-    def test_session_time_limit_stops_the_session(self):
-        self.actions = [action("get_schema")] * 3
-        ticks = iter([0.0, 600.0, 1200.0, 1800.0, 2400.0])
-        with mock.patch.object(tool_loop, "_now", lambda: next(ticks)):
+    def test_session_time_limit_after_an_action_stops_before_the_next_model_call(self):
+        clock = FakeClock()
+        self.actions = [action("get_schema"), action("get_schema")]
+        self.on_service_call = lambda path: setattr(clock, "value", 1600.0)
+        with mock.patch.object(tool_loop, "_now", clock):
             state = self.run_ok()
-        self.assertEqual(len(self.model_requests), 2)
+        self.assertEqual(len(self.model_requests), 1)
         self.assertEqual(self.paths(), ["/schema"])
+        self.assertEqual(state["budget_remaining"], 17)
         self.assertEqual(state["stop_reason"], "session_time_limit")
-        self.assertIn("1500", state["final_response"])
+        self.assertIn("1500-second session limit", state["final_response"])
+        self.assertIn("Phase 1 is incomplete", state["final_response"])
+
+    def test_session_time_limit_after_the_model_response_blocks_the_action(self):
+        clock = FakeClock()
+        self.actions = [action("submit_sql", sql="SELECT 1;")]
+        self.grader_payload = dict(PHASE1_FINAL)
+        self.on_model_call = lambda: setattr(clock, "value", 1501.0)
+        with mock.patch.object(tool_loop, "_now", clock):
+            state = self.run_ok()
+        self.assertEqual(self.service_requests, [])
+        self.assertEqual(state["budget_remaining"], 18)
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        self.assertIn("was reached after the model response", state["final_response"])
+        self.assertFalse(state["task_done"])
+        self.assertFalse(state["phase1_completed"])
+        self.assertEqual(len(state["adk_events"]), 1)
+        self.assertNotIn("action", state["adk_events"][0])
+        self.assertEqual(state["session_elapsed_seconds"], 1501.0)
 
     def test_state_beyond_the_allowed_inputs_never_reaches_the_model(self):
         self.state["internal_note"] = "do-not-send"
@@ -680,6 +821,121 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
                 await tool_loop.run(state, "Answer.", environment, self.client())
         self.assertEqual(len(self.model_requests), 1)
         self.assertEqual([path for path, _ in self.service_requests], ["/submit"])
+
+
+class ToolLoopDeadlineTests(unittest.TestCase):
+    """R-2: the session deadline also bounds calls that are already in flight."""
+
+    LIMIT = 1.0
+    DELAY = 8.0
+
+    def setUp(self):
+        self.model_requests = []
+        self.service_requests = []
+        self.slow_paths = set()
+        self.actions = []
+        self.grader_payload = dict(GRADER_FAILURE)
+
+        async def model_handler(request):
+            self.model_requests.append(json.loads(request.content))
+            if not self.actions:
+                raise AssertionError("The loop asked for a model action the script does not provide")
+            return httpx.Response(200, json=model_reply(self.actions.pop(0)))
+
+        async def service_handler(request):
+            path = request.url.path
+            payload = json.loads(request.content)
+            self.service_requests.append((path, payload))
+            if path in self.slow_paths:
+                await asyncio.sleep(self.DELAY)
+            if path == "/submit":
+                return httpx.Response(200, json=dict(self.grader_payload))
+            if path == "/phase_transition":
+                return httpx.Response(200, json={"status": "ok", "phase": 2})
+            official = {
+                "/schema": {"schema": SCHEMA_TEXT},
+                "/all_column_meanings": {"column_meanings": MEANINGS_TEXT},
+                "/column_meaning": {"meaning": COLUMN_MEANING},
+                "/knowledge_names": {"names": KNOWLEDGE_NAMES},
+                "/knowledge": (
+                    {"knowledge": KNOWLEDGE_ENTRY} if payload.get("knowledge_name")
+                    else {"knowledge": KNOWLEDGE_TEXT}
+                ),
+            }
+            return httpx.Response(200, json=official[path])
+
+        self.client = TestClient(create_app(
+            Environment(httpx.MockTransport(service_handler)),
+            ModelClient(transport=httpx.MockTransport(model_handler), api_key="test-key"),
+            mode="tools",
+        ))
+
+    def run_session(self) -> dict:
+        limit = mock.patch.object(tool_loop, "SESSION_TIME_LIMIT_SECONDS", self.LIMIT)
+        with limit:
+            response = self.client.post("/init_session", json={
+                "task_id": "test-task", "mode": "a-interact", "reset": True,
+                "state": {"task_id": "test-task", "db_name": "demo",
+                          "user_query": "How many customers?", "budget_remaining": 18},
+            })
+            self.assertEqual(response.status_code, 200)
+            response = self.client.post("/run_session", json={
+                "task_id": "test-task", "mode": "a-interact", "message": "Answer.",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["state"]
+
+    def test_deadline_cancels_a_slow_information_lookup(self):
+        self.slow_paths = {"/schema"}
+        self.actions = [action("get_schema"), action("submit_sql", sql="SELECT 1;")]
+        state = self.run_session()
+
+        self.assertEqual([path for path, _ in self.service_requests], ["/schema"])
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        self.assertEqual(state["session_elapsed_seconds"] >= self.LIMIT, True)
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["tool"], "get_schema")
+        self.assertEqual(entry["timed_out"], True)
+        self.assertEqual(entry["cost"], 1.0)
+        self.assertEqual(state["budget_remaining"], 17)
+        self.assertNotIn("failure", state)
+        self.assertIn("outcome is unknown", state["final_response"])
+
+    def test_deadline_cancels_a_slow_submission_and_marks_the_outcome_unknown(self):
+        self.slow_paths = {"/submit"}
+        self.actions = [action("submit_sql", sql="SELECT 1;"), action("submit_sql", sql="SELECT 2;")]
+        state = self.run_session()
+
+        self.assertEqual([path for path, _ in self.service_requests], ["/submit"])
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["tool"], "submit_sql")
+        self.assertEqual(entry["timed_out"], True)
+        self.assertIn("outcome is unknown", entry["result"]["error"])
+        self.assertEqual(state["budget_remaining"], 15)
+        self.assertEqual(state["total_reward"], 0.0)
+        self.assertNotIn("last_submit", state)
+        self.assertNotIn("submit_attempts", state)
+        self.assertNotIn("failure", state)
+
+    def test_deadline_cancels_a_slow_phase_transition_and_keeps_the_reward(self):
+        self.slow_paths = {"/phase_transition"}
+        self.grader_payload = dict(PHASE1_WITH_FOLLOW_UP)
+        self.actions = [action("submit_sql", sql="SELECT 1;"), action("submit_sql", sql="SELECT 2;")]
+        state = self.run_session()
+
+        self.assertEqual(
+            [path for path, _ in self.service_requests], ["/submit", "/phase_transition"]
+        )
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        self.assertEqual(state["total_reward"], 0.7)
+        self.assertTrue(state["phase1_completed"])
+        self.assertEqual(state["current_phase"], 2)
+        self.assertEqual(state["phase_transition"]["completed"], False)
+        self.assertIn("outcome is unknown", state["phase_transition"]["message"])
+        self.assertFalse(state["task_done"])
+        self.assertNotIn("failure", state)
 
 
 class ToolLoopConcurrencyTests(unittest.IsolatedAsyncioTestCase):
