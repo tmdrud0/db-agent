@@ -33,6 +33,15 @@ if (!(Test-Path -LiteralPath $pythonExe) -or !(Test-Path -LiteralPath $combinedD
 }
 New-Item -ItemType Directory -Force $resultsDir, $runtimeDir | Out-Null
 
+function Import-AgentApiKey([string]$PythonExe, [string]$EnvPath) {
+    if ($env:CMD_API_KEY -or !(Test-Path -LiteralPath $EnvPath)) { return }
+
+    # Parse dotenv instead of executing it. Capture the key without logging it.
+    $loadedKey = & $PythonExe -c "import sys; from dotenv import dotenv_values; sys.stdout.write(dotenv_values(sys.argv[1], encoding='utf-8-sig').get('CMD_API_KEY') or '')" $EnvPath
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read CMD_API_KEY from the project .env file.' }
+    if ($loadedKey) { $env:CMD_API_KEY = $loadedKey }
+}
+
 function Wait-Service([string]$Url) {
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         try {
@@ -85,8 +94,9 @@ try {
     if ($existingAgent) {
         Assert-BaselineAgent $agentUrl
     } else {
+        Import-AgentApiKey -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
         if (-not $env:CMD_API_KEY) {
-            throw 'CMD_API_KEY is not set in this PowerShell session. Set the Command Code API key before evaluating. See docs/setup.md.'
+            throw 'CMD_API_KEY is missing. Set it in the project .env file or the current PowerShell environment.'
         }
         $agentProcess = Start-Process -FilePath $pythonExe -WindowStyle Hidden -PassThru `
             -ArgumentList '-m', 'uvicorn', 'agent.server:app', '--host', '127.0.0.1', '--port', '6000' `
