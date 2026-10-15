@@ -11,3 +11,7 @@ vendor/
 private/
 results/
 bird_interact_gt_*.jsonl
+
+# Local task handoff records; preserve spec.md and final.md after user review.
+/docs/agent/tasks/*/implementation.md
+/docs/agent/tasks/*/review.md
