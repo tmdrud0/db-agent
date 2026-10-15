@@ -2,8 +2,9 @@ param(
     [ValidateRange(1, 300)][int]$Limit = 1,
     [ValidateRange(1, 16)][int]$Concurrency = 10,
     [string]$DataPath = '',
-    [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$ResultName = 'deepseek_v41_flash_phase1',
-    [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$OracleResultName = 'oracle_smoke'
+    [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$ResultName = 'deepseek_v41_flash_two_phase',
+    [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$OracleResultName = 'oracle_smoke',
+    [switch]$Calibrated
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,15 +12,19 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 $pythonExe = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $benchmarkRoot = Join-Path $projectRoot 'vendor\BIRD-Interact\BIRD-Interact-ADK'
 $combinedData = Join-Path $benchmarkRoot 'bird-interact-lite\bird_interact_data.combined.jsonl'
+# The original run stays on the default stack and the full Lite input. The
+# calibrated run is requested explicitly and defaults to the calibrated input.
 if ($DataPath) { $combinedData = [IO.Path]::GetFullPath($DataPath) }
+elseif ($Calibrated) { $combinedData = Join-Path $projectRoot 'private\lite30.calibrated.jsonl' }
 $resultsDir = Join-Path $projectRoot 'results'
 $runtimeDir = Join-Path $projectRoot '.runtime-tmp'
 $agentProcess = $null
 $env:PYTHONUTF8 = '1'
 $env:DATASET = 'lite'
 $env:DB_ENV_URL = 'http://127.0.0.1:6002'
-# Health values reported by the intended Phase 1 baseline (agent/server.py).
-$agentName = 'deepseek-v4.1-flash-phase1-baseline'
+$env:USER_SIM_URL = 'http://127.0.0.1:6001'
+# Health values reported by the intended two-phase baseline (agent/server.py).
+$agentName = 'deepseek-v4.1-flash-fixed-context-two-phase'
 $modelId = 'deepseek/deepseek-v4.1-flash'
 $agentUrl = 'http://127.0.0.1:6000'
 
@@ -39,21 +44,40 @@ function Wait-Service([string]$Url) {
     throw "Service did not become ready: $Url"
 }
 
-# A reused or freshly started agent must be the intended Phase 1 baseline,
+# A reused or freshly started agent must be the intended two-phase baseline,
 # not a stale server with different model or settings.
 function Assert-BaselineAgent([string]$Url) {
     $info = Invoke-RestMethod -Uri "$Url/health" -TimeoutSec 5
     if ($info.service -ne 'system_agent' -or $info.agent -ne $agentName -or $info.model -ne $modelId) {
-        throw "Port 6000 is not the Phase 1 baseline agent ($agentName / $modelId). Stop that service before evaluation."
+        throw "Port 6000 is not the two-phase baseline agent ($agentName / $modelId). Stop that service before evaluation."
+    }
+}
+
+# The requested stack must match the running DB service: the calibrated wrapper
+# reports /calibration, the original service answers 404 there.
+function Assert-Calibration([bool]$ExpectCalibrated) {
+    $info = $null
+    try { $info = Invoke-RestMethod -Uri 'http://127.0.0.1:6002/calibration' -TimeoutSec 5 } catch { }
+    if ($ExpectCalibrated -and (!$info -or $info.service -ne 'db_environment_calibration')) {
+        throw 'Calibrated evaluation was requested but port 6002 is not reporting the calibrated DB service.'
+    }
+    if (!$ExpectCalibrated -and $info) {
+        throw 'Port 6002 reports a calibrated DB service. Re-run with -Calibrated or stop the calibrated stack.'
+    }
+    if ($ExpectCalibrated) {
+        Write-Output "Calibration active: $($info | ConvertTo-Json -Compress)"
     }
 }
 
 Push-Location $projectRoot
 try {
-    & docker compose -p db-agent-smoke -f compose.benchmark.yml up --build -d --wait --wait-timeout 900
+    $composeFiles = @('-f', 'compose.benchmark.yml')
+    if ($Calibrated) { $composeFiles += @('-f', 'compose.benchmark.calibrated.yml') }
+    & docker compose -p db-agent-smoke @composeFiles up --build -d --wait --wait-timeout 900
     if ($LASTEXITCODE -ne 0) { throw 'Benchmark containers could not start.' }
     Wait-Service 'http://127.0.0.1:6002/health'
     Wait-Service 'http://127.0.0.1:6001/health'
+    Assert-Calibration $Calibrated
 
     # Reuse a running agent only when it reports the intended baseline.
     $existingAgent = $null

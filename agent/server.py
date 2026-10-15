@@ -13,7 +13,7 @@ from agent.environment import Environment, GradingError
 from agent.loop import InputError, run
 from agent.model import MODEL_ID, ModelClient, ModelError
 
-AGENT_NAME = "deepseek-v4.1-flash-phase1-baseline"
+AGENT_NAME = "deepseek-v4.1-flash-fixed-context-two-phase"
 
 
 class InitRequest(BaseModel):
