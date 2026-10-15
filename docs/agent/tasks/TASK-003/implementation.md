@@ -1,14 +1,61 @@
 # TASK-003 구현 보고서
 
 작업 ID: TASK-003
-명세 버전: 1
-대상 코드 버전: 5f881812347dc26d0a30165be365da9f5d60c048
+명세 버전: 2
+대상 코드 버전: 84c35e87b82a252a487b8fa1d7f38bcc3be7b1be
 상태: ready_for_review
 요약: 공식 정보 3종(schema·전체 컬럼 설명·전체 지식)을 세션당 한 번씩 조회해 프롬프트에 넣고 Phase 1 모델 호출·제출을 한 번씩 수행한다. Phase 1 통과·후속 있음·잔액 3 이상이면 사용자 시뮬레이터 전환 1회 뒤 같은 정보·Phase 1 SQL·공식 결과·후속 질문으로 Phase 2 모델 호출·제출을 한 번씩 수행한다. 조회·제출 비용은 자체 state에서 차감하고 실행하지 않은 행동은 호출·차감하지 않으며 잔액은 음수로 내려가지 않는다(공식 무료 제출 예외 미사용).
 근거: `agent/environment.py`, `agent/loop.py`, `agent/server.py`, `scripts/run-evaluation.ps1`, `tests/test_connection.py`, `results/deepseek_v41_flash_two_phase_calibrated_smoke.json`, `results/oracle_two_phase_calibrated_smoke.json`.
 미확정 사항: 실제 Phase 2 실행은 이번 1문제가 Phase 1 오답으로 끝나 미실행이며 AC-3의 모의 검증과 구분한다. 30문제·원본 기본 스택·다중 동시성 실행은 하지 않았다.
 
-## 커밋과 검토 범위
+## 후속 구현 — 프로젝트 .env 키 자동 로드
+
+2026-10-15 사용자가 “자동으로 읽어오게 코드를 바꾸자”라고 요청했다.
+조율자 역할로 TASK-003 명세를 버전 2로 기록·커밋한 뒤 dev-implement 역할로 실행 스크립트를 수정했다.
+
+기준 SHA: 05b9fa1e7aac7fd43acde3c2a41bd0c83e808e87 (유지).
+명세 버전 2 커밋: d985491c3d7bced0cfdddcc3c2efecbb065f46e4.
+이전 풀이 코드 SHA: 5f881812347dc26d0a30165be365da9f5d60c048.
+이번 코드 SHA: 84c35e87b82a252a487b8fa1d7f38bcc3be7b1be.
+누적 검토 명령: `git diff 05b9fa1e7aac7fd43acde3c2a41bd0c83e808e87 84c35e87b82a252a487b8fa1d7f38bcc3be7b1be --`.
+이번 후속 코드 변경은 scripts/run-evaluation.ps1과 tests/test_evaluation_env.py 두 파일이다.
+
+- 새 에이전트를 시작하기 전 Import-AgentApiKey가 실행된다. 현재 PowerShell의 CMD_API_KEY가 있으면 우선 사용한다.
+- 현재 키가 없으면 작업 디렉터리와 무관하게 프로젝트 루트 .env에서 CMD_API_KEY만 읽어 자식 에이전트에 상속한다.
+  기존 benchmark 의존성 python-dotenv를 사용해 따옴표·주석·UTF-8 BOM을 처리한다. .env를 PowerShell 코드로 실행하지 않는다.
+- Python의 키 출력은 스크립트 변수에 포착해 환경 변수로 넘기며 사용자 stdout·로그에 출력하지 않는다.
+  다른 .env 변수는 현재 PowerShell에 가져오지 않는다. 실제 키·.env·인증 헤더는 커밋하지 않는다.
+- 파일이나 키가 없으면 기존 키 누락 검사에서 .env 또는 현재 환경 변수 설정을 안내하고 중단한다.
+  기존 서버 재사용, API 키를 사용하지 않는 oracle, 코인·프롬프트·풀이 로직은 변경하지 않았다.
+
+AC-8 검증은 tests/test_evaluation_env.py에서 실제 PowerShell AST로 함수만 추출해 실행한다.
+Docker·전체 평가 스크립트를 실행하지 않으며 가짜 .env와 별도 자식 환경만 사용한다.
+기존 키 우선, 키 자동 로드, 파일 부재, 파일 내 키 부재의 4개 시나리오를 검증하고 stdout은 ok 한 줄뿐임을 확인했다.
+다른 작업 디렉터리에서도 명시한 .env 파일을 읽고 관련 없는 환경 변수는 변경하지 않음을 확인했다.
+
+| 검증 | 조건 | 결과 |
+| --- | --- | --- |
+| `.\.venv\Scripts\python.exe -m unittest discover -s tests -p test_evaluation_env.py -v` | Windows PowerShell, 가짜 설정 파일·키, 코드 커밋과 동일 내용 | 4 tests OK, exit 0. 스크립트 전체 PowerShell 파서 검사도 포함. |
+| `.\.venv\Scripts\python.exe -m unittest discover -s tests` | 기존 계약 테스트 포함, 코드 커밋과 동일 내용 | 82 tests OK, exit 0 (기존 78 + 신규 4). |
+| `git diff --check` 및 staged 파일 확인 | 코드 커밋 직전 | 공백 오류 없음, 실행 스크립트·신규 테스트 2개만 포함. |
+| 코드 커밋 후 작업 트리 확인 | 84c35e87b82a252a487b8fa1d7f38bcc3be7b1be | 추적 파일 변경 없음. 기존 미추적 review.md는 보존·커밋 제외. |
+
+Windows 임시 파일·자식 PowerShell·기존 asyncio 소켓을 사용하는 테스트를 자동 승인된 샌드박스 외 실행으로 검증했다.
+실제 프로젝트 .env·실제 API 키를 테스트에서 읽지 않았고 Docker·실제 DB·유료 모델을 호출하지 않았다.
+따라서 아래 실제 smoke는 이전 코드 SHA에 대한 기록이며 이번 새 SHA에서 실평가를 재실행한 것은 아니다.
+
+이제 CMD_API_KEY를 수동 설정하지 않고 다음 명령을 실행할 수 있다(프로젝트 .env와 기존 보정 입력 준비 필요).
+
+```powershell
+.\scripts\run-evaluation.ps1 -Calibrated -Limit 1 -Concurrency 1 `
+  -ResultName 'two_phase_manual_1' -OracleResultName 'oracle_manual_1'
+```
+
+이번 후속 구현 판정은 ready_for_review이며 새 코드의 독립 리뷰는 미실시다.
+기존 review.md·final.md의 버전 1 pass/ready_for_user는 이전 SHA의 역사적 판단으로 유지하며 새 SHA에 자동 적용하지 않는다.
+아래 절은 최초 명세 버전 1·코드 SHA 5f881812347dc26d0a30165be365da9f5d60c048에 대한 원래 기록이다.
+
+## 최초 구현 커밋과 검토 범위
 
 기준 커밋: 05b9fa1e7aac7fd43acde3c2a41bd0c83e808e87
 코드 커밋: 5f881812347dc26d0a30165be365da9f5d60c048
