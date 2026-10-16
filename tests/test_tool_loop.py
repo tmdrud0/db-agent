@@ -94,6 +94,18 @@ class SubmissionKeyTests(unittest.TestCase):
             submission_key("SELECT  'a  b'   AS x;"), submission_key("SELECT 'a  b' AS x;")
         )
 
+    def test_adjacent_string_constants_keep_their_separating_whitespace(self):
+        # 'a' 'b' is a syntax error, while 'a'\n'b' concatenates to 'ab'.
+        self.assertEqual(submission_key("SELECT 'a'\n'b';"), "SELECT 'a'\n'b';")
+        self.assertNotEqual(submission_key("SELECT 'a'\n'b';"), submission_key("SELECT 'a' 'b';"))
+        self.assertNotEqual(submission_key("SELECT 'a'\n'b';"), submission_key("SELECT 'a'  'b';"))
+        self.assertNotEqual(
+            submission_key("SELECT 'a'\nE'b';"), submission_key("SELECT 'a' E'b';")
+        )
+        self.assertEqual(
+            submission_key("SELECT  'a'\n'b'  ;"), submission_key("SELECT 'a'\n'b' ;")
+        )
+
     def test_comment_text_and_line_breaks_are_preserved(self):
         self.assertNotEqual(
             submission_key("SELECT 1; -- a\nb"), submission_key("SELECT 1; -- a b")
@@ -115,6 +127,9 @@ class SubmissionKeyTests(unittest.TestCase):
         self.assertNotEqual(submission_key("SELECT $$a  b$$;"), submission_key("SELECT $$a b$$;"))
         self.assertNotEqual(
             submission_key("SELECT $tag$a  b$tag$;"), submission_key("SELECT $tag$a b$tag$;")
+        )
+        self.assertNotEqual(
+            submission_key("SELECT $한$a  b$한$;"), submission_key("SELECT $한$a b$한$;")
         )
         self.assertEqual(
             submission_key("SELECT 1 WHERE x = $1;"), "SELECT 1 WHERE x = $1;"
@@ -454,6 +469,14 @@ class ToolLoopContractTests(ToolLoopTestCase):
             "different line comment": (
                 "SELECT count(*) FROM customers; -- first  note",
                 "SELECT count(*) FROM customers; -- first note",
+            ),
+            "syntax error fixed with a newline between adjacent strings": (
+                "SELECT count(*) FROM customers WHERE name = 'a' 'b';",
+                "SELECT count(*) FROM customers WHERE name = 'a'\n'b';",
+            ),
+            "different unicode dollar-quoted body": (
+                "SELECT count(*) FROM customers WHERE name = $한$a  b$한$;",
+                "SELECT count(*) FROM customers WHERE name = $한$a b$한$;",
             ),
         }
         for name, (first, revised) in cases.items():

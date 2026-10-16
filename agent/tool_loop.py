@@ -35,7 +35,9 @@ MAX_MODEL_ACTIONS = 24
 SESSION_TIME_LIMIT_SECONDS = 1500.0
 
 SQL_WHITESPACE = " \t\n\r\f\v"
-DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+# Dollar-quote tags follow the unquoted-identifier rules, so non-ASCII
+# characters are valid tag characters.
+DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_\u0080-\U0010FFFF][A-Za-z0-9_\u0080-\U0010FFFF]*)?\$")
 
 
 class SessionExpired(RuntimeError):
@@ -172,25 +174,52 @@ def _block_comment_end(text: str, start: int) -> int | None:
     return None
 
 
+def _starts_string_constant(text: str, index: int) -> bool:
+    """Whether a string constant token starts at index.
+
+    Erring towards yes only narrows the duplicate check, so prefixed forms are
+    included too.
+    """
+    if index >= len(text):
+        return False
+    char = text[index]
+    if char == "'":
+        return True
+    if char == "$":
+        return _dollar_span(text, index) is not None
+    if char in "eEbBxXnN":
+        return index + 1 < len(text) and text[index + 1] == "'"
+    return char in "uU" and index + 1 < len(text) and text[index + 1] == "&"
+
+
 def submission_key(sql: str) -> str:
     """The duplicate key of one submission.
 
     Whitespace between tokens is collapsed, but the text inside string literals,
     quoted identifiers, dollar-quoted bodies and comments is preserved exactly:
     SQL that differs only there means something different, and blocking it would
-    keep a corrected statement away from the official grader. Regions whose
-    extent cannot be decided safely (escape strings, unbalanced quotes or
-    comments) fall back to the unchanged text, which only narrows the check.
+    keep a corrected statement away from the official grader. The whitespace
+    between two adjacent string constants is kept as written as well, because a
+    newline there concatenates them while any other spacing is a syntax error;
+    collapsing it would hide the fix for that error. Regions whose extent cannot
+    be decided safely (escape strings, unbalanced quotes or comments) fall back
+    to the unchanged text, which only narrows the check.
     """
     text = sql.strip()
     parts: list[str] = []
     index = 0
+    after_string = False
     while index < len(text):
         char = text[index]
         if char in SQL_WHITESPACE:
+            start = index
             while index < len(text) and text[index] in SQL_WHITESPACE:
                 index += 1
-            parts.append(" ")
+            if after_string and _starts_string_constant(text, index):
+                parts.append(text[start:index])
+            else:
+                parts.append(" ")
+            after_string = False
             continue
         if char in "'\"":
             span = _quoted_span(text, index, char, allow_escapes=char == "'")
@@ -198,18 +227,21 @@ def submission_key(sql: str) -> str:
                 return text
             parts.append(span[0])
             index = span[1]
+            after_string = char == "'"
             continue
         if char == "$":
             span = _dollar_span(text, index)
             if span is not None:
                 parts.append(span[0])
                 index = span[1]
+                after_string = True
                 continue
         elif text.startswith("--", index):
             end = text.find("\n", index)
             end = len(text) if end == -1 else end + 1
             parts.append(text[index:end])
             index = end
+            after_string = False
             continue
         elif text.startswith("/*", index):
             end = _block_comment_end(text, index)
@@ -217,9 +249,11 @@ def submission_key(sql: str) -> str:
                 return text
             parts.append(text[index:end])
             index = end
+            after_string = False
             continue
         parts.append(char)
         index += 1
+        after_string = False
     return "".join(parts).strip()
 
 
