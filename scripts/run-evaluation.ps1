@@ -32,6 +32,21 @@ $agentNames = @{
 $agentName = $agentNames[$AgentMode]
 $modelId = 'deepseek/deepseek-v4.1-flash'
 $agentUrl = 'http://127.0.0.1:6000'
+$simulatorUrl = 'http://127.0.0.1:6001'
+# The tools mode offers the nine official tools with their official prices.
+# /health reports the real tool set, so a stale service that only shares the
+# mode name (the previous seven-tool version) is rejected instead of reused.
+$expectedTools = [ordered]@{
+    get_schema = 1.0
+    get_all_column_meanings = 1.0
+    get_column_meaning = 0.5
+    get_all_external_knowledge_names = 0.5
+    get_knowledge_definition = 0.5
+    get_all_knowledge_definitions = 1.0
+    execute_sql = 1.0
+    ask_user = 2.0
+    submit_sql = 3.0
+}
 
 if (!(Test-Path -LiteralPath $pythonExe) -or !(Test-Path -LiteralPath $combinedData)) {
     throw 'Python environment or combined Lite data is missing. See docs/setup.md.'
@@ -77,6 +92,31 @@ function Assert-BaselineAgent([string]$Url, [string]$Mode) {
         $info.agent -ne $agentName -or $info.model -ne $modelId) {
         throw "Port 6000 is not the '$Mode' two-phase agent ($agentName / $modelId). Stop that service before evaluation."
     }
+    if ($Mode -eq 'tools') {
+        $reported = @{}
+        foreach ($tool in @($info.tools)) { $reported[[string]$tool.name] = [double]$tool.cost }
+        if ($reported.Count -ne $expectedTools.Count) {
+            throw "The tools agent offers $($reported.Count) tool(s) instead of $($expectedTools.Count). Restart port 6000 with the current code."
+        }
+        foreach ($name in $expectedTools.Keys) {
+            if (!$reported.ContainsKey($name) -or $reported[$name] -ne [double]$expectedTools[$name]) {
+                throw "The tools agent does not offer '$name' at the official price. Restart port 6000 with the current code."
+            }
+        }
+    }
+}
+
+# The tools mode asks the simulator real questions, so the running simulator
+# must report the Command Code connection instead of the vendor's default
+# Anthropic model without a key.
+function Assert-Simulator([string]$Url, [string]$Mode) {
+    $info = Invoke-RestMethod -Uri "$Url/health" -TimeoutSec 5
+    if ($Mode -ne 'tools') { return }
+    if ($info.service -ne 'user_simulator_command_code' -or $info.model -ne $modelId -or
+        $info.prompt_version -ne 'v2' -or [int]$info.max_retries -ne 0 -or
+        [double]$info.max_output_tokens -ne 16384 -or !$info.api_key_present) {
+        throw "The user simulator on port 6001 is not the Command Code v2 connection (service=$($info.service), model=$($info.model), prompt_version=$($info.prompt_version), api_key_present=$($info.api_key_present))."
+    }
 }
 
 # The requested stack must match the running DB service: the calibrated wrapper
@@ -95,6 +135,11 @@ function Assert-Calibration([bool]$ExpectCalibrated) {
     }
 }
 
+# The simulator container receives CMD_API_KEY through the compose
+# environment, so the key is loaded before the stack starts. The agent process
+# started below uses the same value.
+Import-AgentApiKey -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
+
 Push-Location $projectRoot
 try {
     $composeFiles = @('-f', 'compose.benchmark.yml')
@@ -105,6 +150,7 @@ try {
     Wait-Service 'http://127.0.0.1:6002/health'
     Wait-Service 'http://127.0.0.1:6001/health'
     Assert-Calibration $Calibrated
+    Assert-Simulator $simulatorUrl $AgentMode
 
     # Reuse a running agent only when it reports the requested mode.
     $existingAgent = $null
@@ -112,7 +158,6 @@ try {
     if ($existingAgent) {
         Assert-BaselineAgent $agentUrl $AgentMode
     } else {
-        Import-AgentApiKey -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
         if (-not $env:CMD_API_KEY) {
             throw 'CMD_API_KEY is missing. Set it in the project .env file or the current PowerShell environment.'
         }

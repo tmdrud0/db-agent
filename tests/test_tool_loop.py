@@ -10,11 +10,25 @@ import httpx
 from fastapi.testclient import TestClient
 
 from agent import tool_loop
-from agent.environment import Environment, GradingError
+from agent.environment import (
+    ASK_USER_TIMEOUT_SECONDS,
+    EXECUTE_SQL_TIMEOUT_SECONDS,
+    Environment,
+    GradingError,
+)
 from agent.model import API_URL, MAX_OUTPUT_TOKENS, MODEL_ID, ModelClient, ModelError
 from agent.server import AGENT_NAMES, create_app
 from agent.tool_loop import MAX_MODEL_ACTIONS, submission_key
-from agent.tools import ALLOWED_TOOLS, SUBMIT_COST, TOOL_COSTS, ActionError, parse_action
+from agent.tools import (
+    ALLOWED_TOOLS,
+    ASK_USER_COST,
+    EXECUTE_SQL_COST,
+    SUBMIT_COST,
+    TOOL_COSTS,
+    ActionError,
+    parse_action,
+    tool_metadata,
+)
 
 SCHEMA_TEXT = "CREATE TABLE customers (\n  id integer,\n  name text\n);"
 MEANINGS_TEXT = '{\n  "customers|id": "identifier",\n  "customers|name": "full name"\n}'
@@ -22,6 +36,9 @@ COLUMN_MEANING = "identifier of a customer"
 KNOWLEDGE_NAMES = ["Active customer"]
 KNOWLEDGE_ENTRY = '{\n  "id": 7,\n  "knowledge": "Active customer",\n  "definition": "Has orders."\n}'
 KNOWLEDGE_TEXT = '[{"id": 7, "knowledge": "Active customer", "definition": "Has orders."}]'
+EXECUTE_RESULT = "table_count\n3"
+EXECUTE_ERROR = "SQL error: relation \"customers\" does not exist"
+USER_ANSWER = "The result should list the customer counts per region."
 
 GRADER_FAILURE = {
     "passed": False,
@@ -171,11 +188,32 @@ class ActionParsingTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIsInstance(parse_action(content), tuple)
 
-    def test_unavailable_and_unknown_actions_are_rejected(self):
-        for name in ("execute_sql", "ask_user", "drop_table"):
-            with self.subTest(name=name), self.assertRaises(ActionError) as caught:
-                parse_action(action(name))
-            self.assertIn(name, str(caught.exception))
+    def test_the_two_new_tools_are_accepted_and_unknown_actions_are_rejected(self):
+        self.assertEqual(
+            parse_action(action("execute_sql", sql="SELECT 1;")),
+            ("execute_sql", {"sql": "SELECT 1;"}),
+        )
+        self.assertEqual(
+            parse_action(action("ask_user", question="Which columns?")),
+            ("ask_user", {"question": "Which columns?"}),
+        )
+        with self.assertRaises(ActionError) as caught:
+            parse_action(action("drop_table"))
+        self.assertIn("drop_table", str(caught.exception))
+
+    def test_invalid_new_tool_arguments_are_rejected_before_any_call(self):
+        cases = {
+            "blank sql": '{"action": "execute_sql", "args": {"sql": "  "}}',
+            "missing sql": '{"action": "execute_sql", "args": {}}',
+            "blank question": '{"action": "ask_user", "args": {"question": ""}}',
+            "missing question": '{"action": "ask_user"}',
+            "extra argument": (
+                '{"action": "execute_sql", "args": {"sql": "SELECT 1;", "task_id": "x"}}'
+            ),
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name), self.assertRaises(ActionError):
+                parse_action(content)
 
     def test_malformed_responses_are_rejected(self):
         cases = {
@@ -194,7 +232,7 @@ class ActionParsingTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(ActionError):
                 parse_action(content)
 
-    def test_only_the_official_prices_of_the_seven_tools_are_registered(self):
+    def test_only_the_official_prices_of_the_nine_tools_are_registered(self):
         self.assertEqual(
             TOOL_COSTS,
             {
@@ -204,12 +242,86 @@ class ActionParsingTests(unittest.TestCase):
                 "get_all_external_knowledge_names": 0.5,
                 "get_knowledge_definition": 0.5,
                 "get_all_knowledge_definitions": 1.0,
+                "execute_sql": 1.0,
+                "ask_user": 2.0,
                 "submit_sql": 3.0,
             },
         )
+        self.assertEqual(EXECUTE_SQL_COST, 1.0)
+        self.assertEqual(ASK_USER_COST, 2.0)
         self.assertEqual(max(TOOL_COSTS.values()), SUBMIT_COST)
-        for name in ("execute_sql", "ask_user"):
-            self.assertNotIn(name, ALLOWED_TOOLS)
+        self.assertEqual(len(ALLOWED_TOOLS), 9)
+        self.assertEqual(
+            tool_metadata(),
+            [{"name": name, "cost": cost} for name, cost in TOOL_COSTS.items()],
+        )
+
+
+class EnvironmentContractTests(unittest.IsolatedAsyncioTestCase):
+    """The official HTTP contract of execute_sql and ask_user."""
+
+    async def test_execute_sql_accepts_only_the_official_response_shape(self):
+        cases = {
+            "success": ({"success": True, "result": EXECUTE_RESULT, "error": None}, True),
+            "official SQL error": ({"success": False, "result": "", "error": EXECUTE_ERROR}, False),
+            "missing result": ({"success": True}, None),
+            "wrong success type": ({"success": "maybe", "result": "1"}, None),
+        }
+        for name, (payload, expected_success) in cases.items():
+            with self.subTest(name=name):
+                environment = Environment(
+                    httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+                )
+                if expected_success is None:
+                    with self.assertRaises(GradingError):
+                        await environment.execute_sql("test-task", "SELECT 1;")
+                else:
+                    result = await environment.execute_sql("test-task", "SELECT 1;")
+                    self.assertEqual(result.success, expected_success)
+
+    async def test_timeouts_can_be_set_explicitly_and_default_to_120_and_660(self):
+        environment = Environment()
+        self.assertEqual(environment.execute_sql_timeout, EXECUTE_SQL_TIMEOUT_SECONDS)
+        self.assertEqual(environment.ask_user_timeout, ASK_USER_TIMEOUT_SECONDS)
+        with mock.patch.dict(os.environ, {
+            "DB_EXECUTE_SQL_TIMEOUT_SECONDS": "7", "USER_SIM_ASK_TIMEOUT_SECONDS": "42.5",
+        }):
+            configured = Environment()
+        self.assertEqual(configured.execute_sql_timeout, 7.0)
+        self.assertEqual(configured.ask_user_timeout, 42.5)
+        for value in ("0", "-3", "soon"):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {"USER_SIM_ASK_TIMEOUT_SECONDS": value}
+            ):
+                with self.assertRaises(ValueError):
+                    Environment()
+
+    async def test_ask_user_requires_a_non_empty_string_answer(self):
+        for payload in ({"answer": "   "}, {"answer": 7}, {"answer": None}, {}, [], "text"):
+            with self.subTest(payload=payload):
+                environment = Environment(
+                    httpx.MockTransport(
+                        lambda request, payload=payload: httpx.Response(200, json=payload)
+                    )
+                )
+                with self.assertRaises(GradingError):
+                    await environment.ask_user("test-task", "Which?")
+
+    async def test_http_failures_and_broken_responses_are_service_errors(self):
+        failed = Environment(httpx.MockTransport(
+            lambda request: httpx.Response(500, json={"error": {"message": "boom"}})
+        ))
+        with self.assertRaises(GradingError):
+            await failed.execute_sql("test-task", "SELECT 1;")
+        with self.assertRaises(GradingError):
+            await failed.ask_user("test-task", "Which?")
+        broken = Environment(
+            httpx.MockTransport(lambda request: httpx.Response(200, content=b"not json"))
+        )
+        with self.assertRaises(GradingError):
+            await broken.execute_sql("test-task", "SELECT 1;")
+        with self.assertRaises(GradingError):
+            await broken.ask_user("test-task", "Which?")
 
 
 class ToolLoopTestCase(unittest.TestCase):
@@ -223,6 +335,10 @@ class ToolLoopTestCase(unittest.TestCase):
         self.grader_payload = dict(GRADER_FAILURE)
         self.grader_status = 200
         self.transition_status = 200
+        self.execute_payload = {"success": True, "result": EXECUTE_RESULT, "error": None}
+        self.execute_status = 200
+        self.ask_payload = {"answer": USER_ANSWER}
+        self.ask_status = 200
         self.info_payloads = {}
         self.on_model_call = None
         self.on_service_call = None
@@ -251,6 +367,14 @@ class ToolLoopTestCase(unittest.TestCase):
             if self.transition_status != 200:
                 return httpx.Response(self.transition_status, json={"error": {"message": "boom"}})
             return httpx.Response(200, json={"status": "ok", "phase": 2})
+        if path == "/execute":
+            if self.execute_status != 200:
+                return httpx.Response(self.execute_status, json={"error": {"message": "boom"}})
+            return httpx.Response(200, json=dict(self.execute_payload))
+        if path == "/ask":
+            if self.ask_status != 200:
+                return httpx.Response(self.ask_status, json={"error": {"message": "boom"}})
+            return httpx.Response(200, json=dict(self.ask_payload))
         if path in self.info_payloads:
             return httpx.Response(200, json=self.info_payloads[path])
         official = {
@@ -312,6 +436,10 @@ class ToolLoopContractTests(ToolLoopTestCase):
                 self.assertEqual(health["agent"], name)
                 self.assertEqual(health["mode"], mode)
                 self.assertEqual(health["model"], MODEL_ID)
+                expected_tools = tool_metadata() if mode == "tools" else []
+                self.assertEqual(health["tools"], expected_tools)
+                self.assertEqual(health["execute_sql_timeout_seconds"], EXECUTE_SQL_TIMEOUT_SECONDS)
+                self.assertEqual(health["ask_user_timeout_seconds"], ASK_USER_TIMEOUT_SECONDS)
 
         with mock.patch.dict(os.environ, {"AGENT_MODE": "tools"}):
             self.assertEqual(TestClient(create_app()).get("/health").json()["mode"], "tools")
@@ -322,6 +450,8 @@ class ToolLoopContractTests(ToolLoopTestCase):
                 create_app()
 
     def test_each_allowed_tool_uses_its_official_endpoint_and_price(self):
+        execute_sql = "SELECT count(*) FROM customers;"
+        question = "Which customers?"
         self.actions = [
             action("get_schema"),
             action("get_all_column_meanings"),
@@ -329,6 +459,8 @@ class ToolLoopContractTests(ToolLoopTestCase):
             action("get_all_external_knowledge_names"),
             action("get_knowledge_definition", knowledge_name="Active customer"),
             action("get_all_knowledge_definitions"),
+            action("execute_sql", sql=execute_sql),
+            action("ask_user", question=question),
             action("submit_sql", sql="SELECT 1;"),
         ]
         self.grader_payload = dict(PHASE1_FINAL)
@@ -336,7 +468,7 @@ class ToolLoopContractTests(ToolLoopTestCase):
 
         self.assertEqual(self.paths(), [
             "/schema", "/all_column_meanings", "/column_meaning", "/knowledge_names",
-            "/knowledge", "/knowledge", "/submit",
+            "/knowledge", "/knowledge", "/execute", "/ask", "/submit",
         ])
         self.assertEqual(self.service_requests, [
             ("/schema", {"task_id": "test-task"}),
@@ -346,37 +478,47 @@ class ToolLoopContractTests(ToolLoopTestCase):
             ("/knowledge_names", {"task_id": "test-task"}),
             ("/knowledge", {"task_id": "test-task", "knowledge_name": "Active customer"}),
             ("/knowledge", {"task_id": "test-task"}),
+            ("/execute", {"task_id": "test-task", "sql": execute_sql}),
+            ("/ask", {"task_id": "test-task", "question": question}),
             ("/submit", {"task_id": "test-task", "sql": "SELECT 1;"}),
         ])
         self.assertEqual(self.trajectory(state), [
             ("get_schema", 1.0), ("get_all_column_meanings", 1.0), ("get_column_meaning", 0.5),
             ("get_all_external_knowledge_names", 0.5), ("get_knowledge_definition", 0.5),
-            ("get_all_knowledge_definitions", 1.0), ("submit_sql", 3.0),
+            ("get_all_knowledge_definitions", 1.0), ("execute_sql", 1.0), ("ask_user", 2.0),
+            ("submit_sql", 3.0),
         ])
         budgets = [
             (entry["budget_before"], entry["budget_after"]) for entry in state["tool_trajectory"]
         ]
-        self.assertEqual(
-            budgets,
-            [(18, 17), (17, 16), (16, 15.5), (15.5, 15), (15, 14.5), (14.5, 13.5), (13.5, 10.5)],
-        )
-        self.assertEqual(state["budget_remaining"], 10.5)
+        self.assertEqual(budgets, [
+            (18, 17), (17, 16), (16, 15.5), (15.5, 15), (15, 14.5), (14.5, 13.5),
+            (13.5, 12.5), (12.5, 10.5), (10.5, 7.5),
+        ])
+        self.assertEqual(state["budget_remaining"], 7.5)
         self.assertEqual(state["total_reward"], 0.7)
         self.assertTrue(state["phase1_completed"])
         self.assertTrue(state["task_done"])
         self.assertTrue(state["loop_stopped"])
         self.assertEqual(state["stop_reason"], "phase1_completed")
         self.assertEqual(state["last_submit"]["passed"], True)
-        self.assertEqual(state["dialogue_history"], [])
+        self.assertEqual(state["dialogue_history"], [
+            {"role": "agent", "content": question, "phase": 1},
+            {"role": "user", "content": USER_ANSWER, "phase": 1},
+        ])
+        self.assertEqual(state["tool_trajectory"][6]["result"], {
+            "kind": "result", "success": True, "result": EXECUTE_RESULT, "error": None,
+        })
+        self.assertEqual(state["tool_trajectory"][7]["result"], {
+            "kind": "answer", "answer": USER_ANSWER, "error": None,
+        })
 
-        self.assertEqual(len(self.model_requests), 7)
+        self.assertEqual(len(self.model_requests), 9)
         for request in self.model_requests:
             self.assertEqual(request["model"], MODEL_ID)
             self.assertFalse(request["stream"])
             self.assertEqual(request["max_tokens"], MAX_OUTPUT_TOKENS)
             self.assertEqual([m["role"] for m in request["messages"]][:2], ["system", "user"])
-            self.assertNotIn("execute_sql", json.dumps(request))
-            self.assertNotIn("ask_user", json.dumps(request))
         system = self.model_requests[0]["messages"][0]["content"]
         for name in TOOL_COSTS:
             self.assertIn(name, system)
@@ -389,23 +531,30 @@ class ToolLoopContractTests(ToolLoopTestCase):
         observations = [m["content"] for m in self.model_requests[1]["messages"][-1:]]
         self.assertIn(SCHEMA_TEXT, observations[0])
         self.assertIn("[action 1 | phase 1 | get_schema | cost 1 | budget 17]", observations[0])
-        self.assertEqual(
-            state["adk_events"][6]["prompt"], self.model_requests[6]["messages"]
+        execute_feedback = self.model_requests[7]["messages"][-1]["content"]
+        self.assertIn(EXECUTE_RESULT, execute_feedback)
+        self.assertIn(
+            "[action 7 | phase 1 | execute_sql | cost 1 | budget 12.5]", execute_feedback
         )
-        self.assertEqual([e["call_index"] for e in state["adk_events"]], list(range(1, 8)))
+        ask_feedback = self.model_requests[8]["messages"][-1]["content"]
+        self.assertIn(USER_ANSWER, ask_feedback)
+        self.assertIn("[action 8 | phase 1 | ask_user | cost 2 | budget 10.5]", ask_feedback)
         self.assertEqual(
-            [e["action"]["name"] for e in state["adk_events"]],
-            list(TOOL_COSTS)[:6] + ["submit_sql"],
+            state["adk_events"][-1]["prompt"], self.model_requests[-1]["messages"]
+        )
+        self.assertEqual([e["call_index"] for e in state["adk_events"]], list(range(1, 10)))
+        self.assertEqual(
+            [e["action"]["name"] for e in state["adk_events"]], list(TOOL_COSTS)
         )
         self.assertEqual(state["adk_events"][0]["settings"]["endpoint"], API_URL)
         self.assertEqual(state["adk_events"][0]["usage"]["total_tokens"], 14)
         self.assertNotIn("test-key", json.dumps(state))
 
-    def test_unavailable_actions_are_rejected_without_calling_them(self):
+    def test_invalid_new_tool_arguments_cost_nothing_and_call_nothing(self):
         self.actions = [
-            action("execute_sql", sql="SELECT 1;"),
-            action("ask_user", question="Which customers?"),
-            action("drop_table", table="customers"),
+            '{"action": "execute_sql", "args": {"sql": "   "}}',
+            '{"action": "ask_user", "args": {"question": " "}}',
+            '{"action": "ask_user", "args": {"question": "ok", "task_id": "other"}}',
             action("submit_sql", sql="SELECT 1;"),
         ]
         self.grader_payload = dict(PHASE1_FINAL)
@@ -414,14 +563,13 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertEqual(self.paths(), ["/submit"])
         self.assertEqual(self.trajectory(state), [("submit_sql", 3.0)])
         self.assertEqual(state["budget_remaining"], 15)
-        for index, name in enumerate(("execute_sql", "ask_user", "drop_table")):
-            with self.subTest(name=name):
+        self.assertEqual(state["dialogue_history"], [])
+        for index in range(3):
+            with self.subTest(index=index):
                 event = state["adk_events"][index]
                 self.assertIsNone(event["action"])
-                self.assertIn(name, event["action_error"])
-                self.assertNotIn("action_error", state["adk_events"][3])
+                self.assertTrue(event["action_error"])
                 observation = self.model_requests[index + 1]["messages"][-1]["content"]
-                self.assertIn("[action " + str(index + 1), observation)
                 self.assertIn("rejected", observation)
                 self.assertIn("| cost 0 |", observation)
 
@@ -726,6 +874,115 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertEqual(self.service_requests, [])
 
 
+class ExploreAndAskTests(ToolLoopTestCase):
+    """execute_sql and ask_user observations, prices, caching and dialogue."""
+
+    def test_execute_sql_result_feeds_the_next_action_and_scores_nothing(self):
+        sql = "SELECT count(*) FROM customers;"
+        self.actions = [action("execute_sql", sql=sql), action("submit_sql", sql="SELECT 1;")]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.service_requests, [
+            ("/execute", {"task_id": "test-task", "sql": sql}),
+            ("/submit", {"task_id": "test-task", "sql": "SELECT 1;"}),
+        ])
+        self.assertEqual(state["total_reward"], 0.7)
+        self.assertEqual(state["budget_remaining"], 14)
+        self.assertEqual(
+            [(entry["cost"], entry["budget_before"], entry["budget_after"])
+             for entry in state["tool_trajectory"]],
+            [(1.0, 18, 17), (3.0, 17, 14)],
+        )
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["phase"], 1)
+        self.assertEqual(entry["args"], {"sql": sql})
+        self.assertEqual(entry["result"], {
+            "kind": "result", "success": True, "result": EXECUTE_RESULT, "error": None,
+        })
+        self.assertGreaterEqual(entry["elapsed_seconds"], 0)
+        self.assertNotIn("failure", state)
+        feedback = self.model_requests[1]["messages"][-1]["content"]
+        self.assertIn(EXECUTE_RESULT, feedback)
+        self.assertIn("never changes the score", self.model_requests[0]["messages"][0]["content"])
+
+    def test_official_sql_error_is_an_observation_without_a_refund(self):
+        self.execute_payload = {"success": False, "result": "", "error": EXECUTE_ERROR}
+        self.actions = [action("execute_sql", sql="SELECT nope;"),
+                        action("submit_sql", sql="SELECT 1;")]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertNotIn("failure", state)
+        self.assertEqual(state["budget_remaining"], 14)
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["result"]["kind"], "sql_error")
+        self.assertEqual(entry["result"]["success"], False)
+        self.assertEqual(entry["result"]["error"], EXECUTE_ERROR)
+        self.assertEqual(entry["cost"], 1.0)
+        feedback = self.model_requests[1]["messages"][-1]["content"]
+        self.assertIn(EXECUTE_ERROR, feedback)
+        self.assertIn("nothing was submitted", feedback)
+
+    def test_repeated_execute_sql_and_ask_user_are_sent_and_charged_again(self):
+        sql = "SELECT count(*) FROM customers;"
+        question = "Which customers?"
+        self.actions = [
+            action("execute_sql", sql=sql),
+            action("execute_sql", sql=sql),
+            action("ask_user", question=question),
+            action("ask_user", question=question),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/execute", "/execute", "/ask", "/ask", "/submit"])
+        self.assertEqual(state["budget_remaining"], 9)
+        self.assertEqual(
+            [entry["cost"] for entry in state["tool_trajectory"]],
+            [1.0, 1.0, 2.0, 2.0, 3.0],
+        )
+        self.assertNotIn("cached", state["tool_trajectory"][1])
+        self.assertNotIn("cached", state["tool_trajectory"][3])
+        self.assertEqual(state["dialogue_history"], [
+            {"role": "agent", "content": question, "phase": 1},
+            {"role": "user", "content": USER_ANSWER, "phase": 1},
+            {"role": "agent", "content": question, "phase": 1},
+            {"role": "user", "content": USER_ANSWER, "phase": 1},
+        ])
+
+    def test_phase2_question_reaches_the_same_simulator_session(self):
+        question = "Should the follow-up include empty regions?"
+        self.actions = [
+            action("submit_sql", sql="SELECT count(*) FROM customers;"),
+            action("submit_sql", sql="SELECT count(id) FROM customers;"),
+            action("ask_user", question=question),
+            action("submit_sql", sql="SELECT region, count(*) FROM customers GROUP BY region;"),
+        ]
+        self.grader_payloads = [
+            dict(GRADER_FAILURE), dict(PHASE1_WITH_FOLLOW_UP), dict(PHASE2_PASS),
+        ]
+        state = self.run_ok()
+
+        self.assertEqual(
+            self.paths(), ["/submit", "/submit", "/phase_transition", "/ask", "/submit"]
+        )
+        self.assertEqual(self.service_requests[3], (
+            "/ask", {"task_id": "test-task", "question": question},
+        ))
+        self.assertEqual(state["current_phase"], 2)
+        self.assertEqual(state["dialogue_history"], [
+            {"role": "agent", "content": question, "phase": 2},
+            {"role": "user", "content": USER_ANSWER, "phase": 2},
+        ])
+        self.assertEqual(state["tool_trajectory"][3]["phase"], 2)
+        feedback = self.model_requests[3]["messages"][-1]["content"]
+        self.assertIn(USER_ANSWER, feedback)
+        self.assertIn("[action 3 | phase 2 | ask_user | cost 2 |", feedback)
+        self.assertTrue(state["task_done"])
+
+
 class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
     """Failures inspected on the state dict, which HTTP 502 responses omit."""
 
@@ -756,6 +1013,12 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, json=dict(grader_payload or PHASE1_FINAL))
             if path == "/phase_transition":
                 return httpx.Response(200, json={"status": "ok", "phase": 2})
+            if path == "/execute":
+                return httpx.Response(
+                    200, json={"success": True, "result": EXECUTE_RESULT, "error": None}
+                )
+            if path == "/ask":
+                return httpx.Response(200, json={"answer": USER_ANSWER})
             official = {
                 "/schema": {"schema": SCHEMA_TEXT},
                 "/all_column_meanings": {"column_meanings": MEANINGS_TEXT},
@@ -845,6 +1108,63 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.model_requests), 1)
         self.assertEqual([path for path, _ in self.service_requests], ["/submit"])
 
+    async def test_execute_sql_http_failure_is_a_service_error_without_a_retry(self):
+        self.actions = [action("execute_sql", sql="SELECT 1;"), action("execute_sql", sql="SELECT 2;")]
+        state = self.state()
+        environment = self.environment({"/execute": 500})
+        with self.assertRaises(GradingError) as caught:
+            await tool_loop.run(state, "Answer.", environment, self.client())
+        self.assertIn("SQL execution", str(caught.exception))
+        self.assertEqual(state["failure"]["stage"], "execute_sql")
+        self.assertEqual(state["budget_remaining"], 17)
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual([path for path, _ in self.service_requests], ["/execute"])
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["result"]["kind"], "service_error")
+        self.assertEqual(entry["cost"], 1.0)
+        self.assertEqual(entry["budget_before"], 18)
+        self.assertNotIn("submit_attempts", state)
+        # The failed attempt stays cached inside the session; it is never retried.
+        with self.assertRaises(GradingError):
+            await tool_loop.run(state, "Answer.", environment, self.client())
+        self.assertEqual([path for path, _ in self.service_requests], ["/execute"])
+
+    async def test_ask_user_http_failure_never_invents_an_answer(self):
+        self.actions = [
+            action("ask_user", question="Which customers?"), action("submit_sql", sql="SELECT 1;"),
+        ]
+        state = self.state()
+        with self.assertRaises(GradingError):
+            await tool_loop.run(state, "Answer.", self.environment({"/ask": 500}), self.client())
+        self.assertEqual(state["failure"]["stage"], "ask_user")
+        self.assertEqual(state.get("dialogue_history", []), [])
+        self.assertEqual(state["budget_remaining"], 16)
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual([path for path, _ in self.service_requests], ["/ask"])
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["result"]["kind"], "service_error")
+        self.assertIsNone(entry["result"]["answer"])
+        self.assertIn("User question", entry["result"]["error"])
+        self.assertEqual(entry["cost"], 2.0)
+        self.assertGreaterEqual(entry["elapsed_seconds"], 0)
+
+    async def test_empty_ask_answer_is_a_service_error_not_a_user_reply(self):
+        self.actions = [action("ask_user", question="Which customers?")]
+        state = self.state()
+
+        def handler(request):
+            self.service_requests.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(200, json={"answer": "   "})
+
+        with self.assertRaises(GradingError) as caught:
+            await tool_loop.run(
+                state, "Answer.", Environment(httpx.MockTransport(handler)), self.client()
+            )
+        self.assertIn("non-empty answer", str(caught.exception))
+        self.assertEqual(state["failure"]["stage"], "ask_user")
+        self.assertEqual(state.get("dialogue_history", []), [])
+        self.assertEqual(state["budget_remaining"], 16)
+
 
 class ToolLoopDeadlineTests(unittest.TestCase):
     """R-2: the session deadline also bounds calls that are already in flight."""
@@ -875,6 +1195,12 @@ class ToolLoopDeadlineTests(unittest.TestCase):
                 return httpx.Response(200, json=dict(self.grader_payload))
             if path == "/phase_transition":
                 return httpx.Response(200, json={"status": "ok", "phase": 2})
+            if path == "/execute":
+                return httpx.Response(
+                    200, json={"success": True, "result": EXECUTE_RESULT, "error": None}
+                )
+            if path == "/ask":
+                return httpx.Response(200, json={"answer": USER_ANSWER})
             official = {
                 "/schema": {"schema": SCHEMA_TEXT},
                 "/all_column_meanings": {"column_meanings": MEANINGS_TEXT},
@@ -921,6 +1247,45 @@ class ToolLoopDeadlineTests(unittest.TestCase):
         self.assertEqual(entry["timed_out"], True)
         self.assertEqual(entry["cost"], 1.0)
         self.assertEqual(state["budget_remaining"], 17)
+        self.assertNotIn("failure", state)
+        self.assertIn("outcome is unknown", state["final_response"])
+
+    def test_deadline_cancels_a_slow_execute_sql_without_a_refund(self):
+        self.slow_paths = {"/execute"}
+        self.actions = [
+            action("execute_sql", sql="SELECT 1;"), action("submit_sql", sql="SELECT 2;"),
+        ]
+        state = self.run_session()
+
+        self.assertEqual([path for path, _ in self.service_requests], ["/execute"])
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["tool"], "execute_sql")
+        self.assertEqual(entry["timed_out"], True)
+        self.assertEqual(entry["result"]["kind"], "cancelled")
+        self.assertEqual(entry["cost"], 1.0)
+        self.assertEqual(state["budget_remaining"], 17)
+        self.assertNotIn("failure", state)
+        self.assertIn("outcome is unknown", state["final_response"])
+
+    def test_deadline_cancels_a_slow_ask_user_without_inventing_an_answer(self):
+        self.slow_paths = {"/ask"}
+        self.actions = [
+            action("ask_user", question="Which customers?"),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        state = self.run_session()
+
+        self.assertEqual([path for path, _ in self.service_requests], ["/ask"])
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        self.assertEqual(state["dialogue_history"], [])
+        entry = state["tool_trajectory"][0]
+        self.assertEqual(entry["tool"], "ask_user")
+        self.assertEqual(entry["timed_out"], True)
+        self.assertEqual(entry["result"]["kind"], "cancelled")
+        self.assertIsNone(entry["result"]["answer"])
+        self.assertEqual(entry["cost"], 2.0)
+        self.assertEqual(state["budget_remaining"], 16)
         self.assertNotIn("failure", state)
         self.assertIn("outcome is unknown", state["final_response"])
 

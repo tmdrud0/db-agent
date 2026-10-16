@@ -14,6 +14,7 @@ from agent.environment import Environment, GradingError
 from agent.loop import InputError, run
 from agent.model import MODEL_ID, ModelClient, ModelError
 from agent.tool_loop import run as run_tool_loop
+from agent.tools import tool_metadata
 
 # Each mode is selected explicitly (AGENT_MODE or create_app) and reported by /health.
 AGENT_NAMES = {
@@ -69,6 +70,11 @@ def create_app(
             "agent": AGENT_NAMES[selected],
             "mode": selected,
             "model": MODEL_ID,
+            # A tools service is identified by its real tool set, so a stale
+            # service with a different tool set cannot be reused by name alone.
+            "tools": tool_metadata() if selected == "tools" else [],
+            "execute_sql_timeout_seconds": environment.execute_sql_timeout,
+            "ask_user_timeout_seconds": environment.ask_user_timeout,
         }
 
     @app.post("/init_session")

@@ -1,8 +1,8 @@
 """Official a-interact tools this loop exposes, with the official coin prices.
 
-execute_sql and ask_user are part of the official a-interact tool set, but they
-are deliberately absent here: the model can neither call nor execute them, and
-they never appear in a model request.
+All nine official tools are offered to the model in tools mode. execute_sql and
+ask_user reach the official DB service and user simulator through HTTP; the
+loop charges their official prices and records their observations.
 """
 
 import json
@@ -12,7 +12,8 @@ from typing import Awaitable, Callable
 from agent.environment import Environment
 
 SUBMIT_COST = 3.0
-UNAVAILABLE_TOOLS = ("execute_sql", "ask_user")
+EXECUTE_SQL_COST = 1.0
+ASK_USER_COST = 2.0
 
 
 class ActionError(ValueError):
@@ -96,7 +97,26 @@ SUBMIT_SPEC = ToolSpec(
     required=("sql",), run=None,
 )
 
-ALLOWED_TOOLS = {**INFORMATION_TOOLS, "submit_sql": SUBMIT_SPEC}
+EXECUTE_SQL_SPEC = ToolSpec(
+    name="execute_sql", cost=EXECUTE_SQL_COST,
+    arguments='{"sql": "<one PostgreSQL statement starting with SELECT, WITH or EXPLAIN>"}',
+    summary="run one read-only statement against the task database and see its result as exploration",
+    required=("sql",), run=None,
+)
+
+ASK_USER_SPEC = ToolSpec(
+    name="ask_user", cost=ASK_USER_COST,
+    arguments='{"question": "<one question for the task user>"}',
+    summary="ask the task user one clarification question and see the official answer",
+    required=("question",), run=None,
+)
+
+ALLOWED_TOOLS = {
+    **INFORMATION_TOOLS,
+    "execute_sql": EXECUTE_SQL_SPEC,
+    "ask_user": ASK_USER_SPEC,
+    "submit_sql": SUBMIT_SPEC,
+}
 TOOL_COSTS = {name: spec.cost for name, spec in ALLOWED_TOOLS.items()}
 
 
@@ -106,6 +126,11 @@ def catalog() -> str:
         f"- {spec.name}: {spec.summary}. arguments: {spec.arguments}. Cost: {spec.cost:g}"
         for spec in ALLOWED_TOOLS.values()
     )
+
+
+def tool_metadata() -> list[dict]:
+    """The tool set and official prices, as non-secret runtime metadata."""
+    return [{"name": spec.name, "cost": spec.cost} for spec in ALLOWED_TOOLS.values()]
 
 
 def validate_args(spec: ToolSpec, args) -> dict:
@@ -133,10 +158,6 @@ def parse_action(content: str) -> tuple[str, dict]:
     if not isinstance(name, str) or not name.strip():
         raise ActionError('The JSON object needs an "action" member naming one tool.')
     name = name.strip()
-    if name in UNAVAILABLE_TOOLS:
-        raise ActionError(
-            f"'{name}' is not available in this loop. Available actions: {', '.join(ALLOWED_TOOLS)}."
-        )
     spec = ALLOWED_TOOLS.get(name)
     if spec is None:
         raise ActionError(

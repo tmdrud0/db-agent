@@ -2,16 +2,17 @@
 turn through a JSON-only chat protocol.
 
 The model sees the question, the database name, its own actions, the official
-observations and the coin budget. It never sees ground truth, and execute_sql
-and ask_user are neither offered nor executed. Phase transitions after a
-passing Phase 1 submission stay under code control.
+observations and the coin budget. It never sees ground truth. All nine official
+tools are offered: information lookups, execute_sql exploration, ask_user
+questions and submit_sql. Phase transitions after a passing Phase 1 submission
+stay under code control.
 """
 
 import asyncio
 import re
 import time
 
-from agent.environment import Environment, GradingError
+from agent.environment import Environment, ExecuteResult, GradingError
 from agent.model import (
     API_URL,
     MAX_OUTPUT_TOKENS,
@@ -87,7 +88,15 @@ SYSTEM_PROMPT = (
     "Rules:\n"
     "- Only the actions above exist. Any other action name is rejected without cost.\n"
     "- An information request that repeats an earlier one is answered from the session cache;\n"
-    "  its coin cost still applies.\n"
+    "  its coin cost still applies. execute_sql and ask_user are never cached: every call is\n"
+    "  sent to the official service again and charged, because the database and the phase\n"
+    "  can have changed.\n"
+    "- execute_sql explores with one read-only statement. Its result never changes the score\n"
+    "  and never replaces submit_sql; an official SQL error is an observation, not a penalty.\n"
+    "- ask_user receives the official answer of the task user. The answer is an observation;\n"
+    "  decide yourself whether and when to ask.\n"
+    "- A call is charged its coin cost when it starts; a failed or interrupted call is not\n"
+    "  refunded.\n"
     "- Submitting the same SQL text twice in one phase is rejected without cost; revise the SQL\n"
     "  before submitting again.\n"
     "- A failed submission can be retried while the budget lasts. The official rewards are 0.7\n"
@@ -324,21 +333,26 @@ async def _information(
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before {name} could start")
     state["budget_remaining"] = budget_before - spec.cost
+    started = _now()
     try:
         content = await _bounded(spec.run(environment, state["task_id"], args), remaining, name)
     except SessionExpired as exc:
         record_action(
             state, name, args, {"error": str(exc)}, spec.cost, budget_before,
-            phase=phase, timed_out=True,
+            phase=phase, timed_out=True, elapsed_seconds=round(_now() - started, 3),
         )
         raise
     except GradingError as exc:
         record_action(
-            state, name, args, {"error": str(exc)}, spec.cost, budget_before, phase=phase
+            state, name, args, {"error": str(exc)}, spec.cost, budget_before, phase=phase,
+            elapsed_seconds=round(_now() - started, 3),
         )
         state["failure"] = {"stage": "information", "message": str(exc)}
         raise
-    record_action(state, name, args, content, spec.cost, budget_before, phase=phase)
+    record_action(
+        state, name, args, content, spec.cost, budget_before, phase=phase,
+        elapsed_seconds=round(_now() - started, 3),
+    )
     return content
 
 
@@ -372,6 +386,7 @@ async def _submit_action(
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before the submission could start")
     state["budget_remaining"] = budget_before - SUBMIT_COST
+    started = _now()
     try:
         result = await _bounded(
             environment.submit(state["task_id"], sql), remaining, "the submission"
@@ -381,19 +396,19 @@ async def _submit_action(
         # unknown outcome instead of a failure or a pass.
         record_action(
             state, "submit_sql", {"sql": sql}, {"error": str(exc)}, SUBMIT_COST, budget_before,
-            phase=phase, timed_out=True,
+            phase=phase, timed_out=True, elapsed_seconds=round(_now() - started, 3),
         )
         raise
     except GradingError as exc:
         record_action(
             state, "submit_sql", {"sql": sql}, {"error": str(exc)}, SUBMIT_COST, budget_before,
-            phase=phase,
+            phase=phase, elapsed_seconds=round(_now() - started, 3),
         )
         state["failure"] = {"stage": "grader", "message": str(exc)}
         raise
     record_action(
         state, "submit_sql", {"sql": sql}, result.model_dump(), SUBMIT_COST, budget_before,
-        phase=phase,
+        phase=phase, elapsed_seconds=round(_now() - started, 3),
     )
     state["last_submit"] = result.model_dump()
     state.setdefault("submit_attempts", []).append({"phase": phase, "sql": sql})
@@ -444,6 +459,102 @@ async def _submit_action(
     state["phase2_completed"] = True
     state["task_done"] = True
     return "phase2_completed", result.message
+
+
+def _execute_observation(result: ExecuteResult) -> str:
+    if result.success:
+        return (
+            "Execution result (exploration only; nothing was submitted and no points can be "
+            f"won or lost here):\n{result.result}"
+        )
+    return (
+        "The official SQL service reported an error for this statement; nothing was submitted "
+        f"and no submission was charged:\n{result.error or 'Execution failed without details'}"
+    )
+
+
+async def _execute_action(
+    state: dict, environment: Environment, sql: str, phase: int, deadline: float
+) -> str:
+    """Run one execute_sql call; an official SQL error is an observation, not a failure."""
+    spec = ALLOWED_TOOLS["execute_sql"]
+    budget_before = budget(state)
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        raise SessionExpired(f"{_limit_text()} was reached before execute_sql could start")
+    state["budget_remaining"] = budget_before - spec.cost
+    started = _now()
+    try:
+        result = await _bounded(
+            environment.execute_sql(state["task_id"], sql), remaining, "execute_sql"
+        )
+    except SessionExpired as exc:
+        record_action(
+            state, spec.name, {"sql": sql}, {"kind": "cancelled", "error": str(exc)},
+            spec.cost, budget_before, phase=phase, timed_out=True,
+            elapsed_seconds=round(_now() - started, 3),
+        )
+        raise
+    except GradingError as exc:
+        record_action(
+            state, spec.name, {"sql": sql}, {"kind": "service_error", "error": str(exc)},
+            spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
+        )
+        state["failure"] = {"stage": "execute_sql", "message": str(exc)}
+        raise
+    record_action(
+        state, spec.name, {"sql": sql},
+        {
+            "kind": "result" if result.success else "sql_error",
+            "success": result.success, "result": result.result, "error": result.error,
+        },
+        spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
+    )
+    return _execute_observation(result)
+
+
+async def _ask_action(
+    state: dict, environment: Environment, question: str, phase: int, deadline: float
+) -> str:
+    """Ask the official user simulator; only a valid answer enters the dialogue."""
+    spec = ALLOWED_TOOLS["ask_user"]
+    budget_before = budget(state)
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        raise SessionExpired(f"{_limit_text()} was reached before ask_user could start")
+    state["budget_remaining"] = budget_before - spec.cost
+    started = _now()
+    try:
+        answer = await _bounded(
+            environment.ask_user(state["task_id"], question), remaining, "ask_user"
+        )
+    except SessionExpired as exc:
+        # The simulator may still be calling its model; no answer is invented for the
+        # interrupted question.
+        record_action(
+            state, spec.name, {"question": question},
+            {"kind": "cancelled", "answer": None, "error": str(exc)},
+            spec.cost, budget_before, phase=phase, timed_out=True,
+            elapsed_seconds=round(_now() - started, 3),
+        )
+        raise
+    except GradingError as exc:
+        record_action(
+            state, spec.name, {"question": question},
+            {"kind": "service_error", "answer": None, "error": str(exc)},
+            spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
+        )
+        state["failure"] = {"stage": "ask_user", "message": str(exc)}
+        raise
+    record_action(
+        state, spec.name, {"question": question},
+        {"kind": "answer", "answer": answer, "error": None},
+        spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
+    )
+    history = state.setdefault("dialogue_history", [])
+    history.append({"role": "agent", "content": question, "phase": phase})
+    history.append({"role": "user", "content": answer, "phase": phase})
+    return f"User answer:\n{answer}"
 
 
 async def run(state: dict, message: str, environment: Environment, model: ModelClient) -> str:
@@ -524,7 +635,14 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
                     return stop(*outcome)
                 continue
 
-            content = await _information(state, environment, name, args, phase, deadline)
+            if name == "execute_sql":
+                content = await _execute_action(state, environment, args["sql"], phase, deadline)
+            elif name == "ask_user":
+                content = await _ask_action(
+                    state, environment, args["question"], phase, deadline
+                )
+            else:
+                content = await _information(state, environment, name, args, phase, deadline)
         except SessionExpired as exc:
             return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
         messages.append({

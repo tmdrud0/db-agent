@@ -3,7 +3,7 @@ x-benchmark: &benchmark
     context: .
     dockerfile: benchmark/Dockerfile
   image: db-agent-benchmark-runtime:local
-  environment:
+  environment: &benchmark-env
     DATASET: lite
     PG_HOST: postgresql
     PG_PORT: 5432
@@ -17,6 +17,22 @@ x-benchmark: &benchmark
   depends_on:
     postgresql:
       condition: service_healthy
+
+# The user simulator answers questions with Command Code model calls, so it
+# gets the connection values it needs on top of the shared stack and nothing
+# more; the mount keeps the vendor checkout read-only.
+x-user-simulator: &user-simulator
+  environment:
+    <<: *benchmark-env
+    CMD_API_KEY: ${CMD_API_KEY:-}
+    DB_ENV_URL: http://db-environment:6002
+    PYTHONPATH: /benchmark:/simulator-adapter
+    USER_SIM_MODEL: deepseek/deepseek-v4.1-flash
+    USER_SIM_TIMEOUT_SECONDS: "300"
+    USER_SIM_MAX_OUTPUT_TOKENS: "16384"
+  volumes:
+    - ./vendor/BIRD-Interact/BIRD-Interact-ADK:/benchmark:ro
+    - ./benchmark/user_sim:/simulator-adapter:ro
 
 services:
   postgresql:
@@ -39,8 +55,9 @@ services:
     ports: ["127.0.0.1:6002:6002"]
 
   user-simulator:
-    <<: *benchmark
-    command: ["python", "-m", "uvicorn", "user_simulator.server:app", "--host", "0.0.0.0", "--port", "6001"]
+    <<: [*user-simulator, *benchmark]
+    command: ["python", "-m", "uvicorn", "command_code_simulator:create_app", "--factory",
+              "--host", "0.0.0.0", "--port", "6001"]
     ports: ["127.0.0.1:6001:6001"]
 
 volumes:
