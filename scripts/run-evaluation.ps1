@@ -68,6 +68,15 @@ function Invoke-External([string]$Label, [scriptblock]$Command) {
     if ($LASTEXITCODE -ne 0) { throw "$Label (exit code $LASTEXITCODE)." }
 }
 
+# A leftover AGENT_MODE from an older runner must fail with its value and a
+# removal instruction instead of surfacing only a service startup timeout.
+function Assert-AgentModeEnvironment {
+    $mode = [string]$env:AGENT_MODE
+    if ($mode -and $mode.Trim().ToLowerInvariant() -ne 'tools') {
+        throw "AGENT_MODE='$mode' is set, but only the tool-selecting agent remains. Run 'Remove-Item Env:AGENT_MODE' and retry."
+    }
+}
+
 function Wait-Service([string]$Url) {
     for ($attempt = 0; $attempt -lt 30; $attempt++) {
         try {
@@ -126,6 +135,10 @@ function Assert-Calibration([bool]$ExpectCalibrated) {
         Write-Output "Calibration active: $($info | ConvertTo-Json -Compress)"
     }
 }
+
+# Fail before containers or an agent start when an old runner left a removed
+# mode in this shell.
+Assert-AgentModeEnvironment
 
 # The simulator container receives CMD_API_KEY through the compose
 # environment, so the key is loaded before the stack starts. The agent process
