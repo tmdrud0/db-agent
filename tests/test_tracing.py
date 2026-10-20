@@ -357,6 +357,28 @@ class SuccessfulTraceTests(TracingSessionTestCase):
                 {"input": 127, "input_cached_tokens": 640, "output": 22, "total": 789},
             )
 
+    def test_ignored_actions_reach_the_generation_metadata(self):
+        first = action("submit_sql", sql="SELECT 1;") + "\n" + action(
+            "submit_sql", sql="SELECT 2;"
+        )
+        self.actions = [
+            first,
+            action("submit_sql", sql="SELECT 2;"),
+            action("submit_sql", sql="SELECT 3;"),
+        ]
+        self.grader_payloads = [
+            dict(PHASE1_FAIL), dict(PHASE1_FOLLOW_UP), dict(PHASE2_PASS)
+        ]
+        with TestClient(self.app()) as client:
+            response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+
+        metadata = self.generations(self.root())[0].updates[0]["metadata"]
+        self.assertEqual(metadata["action_count"], 2)
+        self.assertEqual(metadata["ignored_actions"], 1)
+        observation = self.model_requests[1]["messages"][-1]["content"]
+        self.assertIn("contained 2 actions", observation)
+
     def test_model_retry_count_reaches_the_generation_metadata(self):
         self.actions = [action("submit_sql", sql="SELECT 1;")]
         self.failing_attempts = 2

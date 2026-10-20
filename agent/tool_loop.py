@@ -9,7 +9,6 @@ stay under code control.
 """
 
 import asyncio
-import re
 import time
 
 from agent.environment import Environment, ExecuteResult, GradingError
@@ -30,16 +29,19 @@ from agent.session import (
     resolve_query,
     restore_failure,
 )
-from agent.tools import ALLOWED_TOOLS, SUBMIT_COST, ActionError, catalog, parse_action
+from agent.tools import (
+    ALLOWED_TOOLS,
+    SUBMIT_COST,
+    ActionError,
+    ParsedAction,
+    catalog,
+    parse_response,
+    submission_key,
+)
 from agent.tracing import Generation, SessionTrace, Tracer
 
 MAX_MODEL_ACTIONS = 24
 SESSION_TIME_LIMIT_SECONDS = 1500.0
-
-SQL_WHITESPACE = " \t\n\r\f\v"
-# Dollar-quote tags follow the unquoted-identifier rules, so non-ASCII
-# characters are valid tag characters.
-DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_\u0080-\U0010FFFF][A-Za-z0-9_\u0080-\U0010FFFF]*)?\$")
 
 
 class SessionExpired(RuntimeError):
@@ -131,6 +133,15 @@ def _observation(index: int, phase: int, name: str, cost: float, state: dict, bo
     )
 
 
+def _ignored_notice(parsed: ParsedAction) -> str:
+    if not parsed.ignored_actions:
+        return ""
+    return (
+        f"\nThe response contained {parsed.action_count} actions; only the first was executed. "
+        "Send exactly one action per response."
+    )
+
+
 def _outcome(state: dict) -> str:
     if state.get("phase1_completed"):
         return "Phase 1 passed; the follow-up phase is incomplete."
@@ -139,132 +150,6 @@ def _outcome(state: dict) -> str:
 
 def _model_actions(state: dict) -> int:
     return sum(1 for event in state.get("adk_events", []) if event.get("type") == "model_call")
-
-
-def _quoted_span(text: str, start: int, quote: str, allow_escapes: bool) -> tuple[str, int] | None:
-    """Return one quoted region verbatim, or None when its extent is ambiguous."""
-    index = start + 1
-    while index < len(text):
-        if text[index] == "\\" and allow_escapes:
-            return None
-        if text[index] == quote:
-            if index + 1 < len(text) and text[index + 1] == quote:
-                index += 2
-                continue
-            return text[start:index + 1], index + 1
-        index += 1
-    return None
-
-
-def _dollar_span(text: str, start: int) -> tuple[str, int] | None:
-    match = DOLLAR_QUOTE.match(text, start)
-    if match is None:
-        return None
-    end = text.find(match.group(0), match.end())
-    if end == -1:
-        return None
-    end += len(match.group(0))
-    return text[start:end], end
-
-
-def _block_comment_end(text: str, start: int) -> int | None:
-    depth = 0
-    index = start
-    while index < len(text):
-        if text.startswith("/*", index):
-            depth += 1
-            index += 2
-        elif text.startswith("*/", index):
-            depth -= 1
-            index += 2
-            if depth == 0:
-                return index
-        else:
-            index += 1
-    return None
-
-
-def _starts_string_constant(text: str, index: int) -> bool:
-    """Whether a string constant token starts at index.
-
-    Erring towards yes only narrows the duplicate check, so prefixed forms are
-    included too.
-    """
-    if index >= len(text):
-        return False
-    char = text[index]
-    if char == "'":
-        return True
-    if char == "$":
-        return _dollar_span(text, index) is not None
-    if char in "eEbBxXnN":
-        return index + 1 < len(text) and text[index + 1] == "'"
-    return char in "uU" and index + 1 < len(text) and text[index + 1] == "&"
-
-
-def submission_key(sql: str) -> str:
-    """The duplicate key of one submission.
-
-    Whitespace between tokens is collapsed, but the text inside string literals,
-    quoted identifiers, dollar-quoted bodies and comments is preserved exactly:
-    SQL that differs only there means something different, and blocking it would
-    keep a corrected statement away from the official grader. The whitespace
-    between two adjacent string constants is kept as written as well, because a
-    newline there concatenates them while any other spacing is a syntax error;
-    collapsing it would hide the fix for that error. Regions whose extent cannot
-    be decided safely (escape strings, unbalanced quotes or comments) fall back
-    to the unchanged text, which only narrows the check.
-    """
-    text = sql.strip()
-    parts: list[str] = []
-    index = 0
-    after_string = False
-    while index < len(text):
-        char = text[index]
-        if char in SQL_WHITESPACE:
-            start = index
-            while index < len(text) and text[index] in SQL_WHITESPACE:
-                index += 1
-            if after_string and _starts_string_constant(text, index):
-                parts.append(text[start:index])
-            else:
-                parts.append(" ")
-            after_string = False
-            continue
-        if char in "'\"":
-            span = _quoted_span(text, index, char, allow_escapes=char == "'")
-            if span is None:
-                return text
-            parts.append(span[0])
-            index = span[1]
-            after_string = char == "'"
-            continue
-        if char == "$":
-            span = _dollar_span(text, index)
-            if span is not None:
-                parts.append(span[0])
-                index = span[1]
-                after_string = True
-                continue
-        elif text.startswith("--", index):
-            end = text.find("\n", index)
-            end = len(text) if end == -1 else end + 1
-            parts.append(text[index:end])
-            index = end
-            after_string = False
-            continue
-        elif text.startswith("/*", index):
-            end = _block_comment_end(text, index)
-            if end is None:
-                return text
-            parts.append(text[index:end])
-            index = end
-            after_string = False
-            continue
-        parts.append(char)
-        index += 1
-        after_string = False
-    return "".join(parts).strip()
 
 
 def _is_duplicate_submission(state: dict, sql: str, phase: int) -> bool:
@@ -412,6 +297,7 @@ async def _submit_action(
     index: int,
     deadline: float,
     trace: SessionTrace | None = None,
+    notice: str = "",
 ) -> tuple[str, str] | None:
     """Submit, or report a blocked duplicate. Returns the stop reason when the task ends."""
     budget_before = budget(state)
@@ -432,7 +318,7 @@ async def _submit_action(
             span.finish(entry)
         body = (
             f"The same SQL text was already submitted in phase {phase} and was not sent again. "
-            "Revise the SQL before submitting."
+            "Revise the SQL before submitting." + notice
         )
         messages.append({
             "role": "user",
@@ -488,7 +374,9 @@ async def _submit_action(
             span.finish(entry)
         messages.append({
             "role": "user",
-            "content": _observation(index, phase, "submit_sql", SUBMIT_COST, state, result.message),
+            "content": _observation(
+                index, phase, "submit_sql", SUBMIT_COST, state, result.message + notice
+            ),
         })
         return None
 
@@ -540,7 +428,7 @@ async def _submit_action(
             span.finish(entry, phase_transition=state["phase_transition"])
         body = (
             f"{result.message}\nThe phase 1 SQL is applied to the database.\n"
-            f"Follow-up question:\n{result.follow_up_query or ''}"
+            f"Follow-up question:\n{result.follow_up_query or ''}" + notice
         )
         messages.append({
             "role": "user",
@@ -788,11 +676,14 @@ async def _session_loop(
                 f"was not executed. {_outcome(state)}",
             )
         try:
-            name, args = parse_action(reply.content)
+            if reply.truncated:
+                raise ActionError(
+                    "The response hit the output token limit, so no action was executed. "
+                    "Reply with one complete JSON action."
+                )
+            parsed = parse_response(reply.content)
         except ActionError as exc:
             reason = str(exc)
-            if reply.truncated:
-                reason = "The response hit the output token limit before a complete action. " + reason
             event["action_error"] = reason
             event["action"] = None
             if generation is not None:
@@ -802,14 +693,26 @@ async def _session_loop(
                 "content": _observation(index, phase, "rejected", 0.0, state, reason),
             })
             continue
+        name, args = parsed.name, parsed.args
         event["action"] = {"name": name, "args": args}
+        if parsed.action_count > 1:
+            event["action_count"] = parsed.action_count
+        if parsed.ignored_actions:
+            event["ignored_actions"] = parsed.ignored_actions
         if generation is not None:
-            generation.finish(reply, action={"name": name, "args": args})
+            generation.finish(
+                reply,
+                action={"name": name, "args": args},
+                action_count=parsed.action_count if parsed.action_count > 1 else None,
+                ignored_actions=parsed.ignored_actions or None,
+            )
+        notice = _ignored_notice(parsed)
 
         try:
             if name == "submit_sql":
                 outcome = await _submit_action(
-                    state, environment, args["sql"], phase, messages, index, deadline, trace
+                    state, environment, args["sql"], phase, messages, index, deadline, trace,
+                    notice=notice,
                 )
                 if outcome is not None:
                     return stop(*outcome)
@@ -831,5 +734,7 @@ async def _session_loop(
             return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
         messages.append({
             "role": "user",
-            "content": _observation(index, phase, name, ALLOWED_TOOLS[name].cost, state, content),
+            "content": _observation(
+                index, phase, name, ALLOWED_TOOLS[name].cost, state, content + notice
+            ),
         })

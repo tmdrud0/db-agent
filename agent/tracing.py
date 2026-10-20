@@ -91,7 +91,13 @@ class Generation:
     """One model call in a session trace."""
 
     def finish(
-        self, reply: Any, *, action: dict | None = None, action_error: str | None = None
+        self,
+        reply: Any,
+        *,
+        action: dict | None = None,
+        action_error: str | None = None,
+        action_count: int | None = None,
+        ignored_actions: int | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -153,7 +159,9 @@ class Tracer:
 
 
 class _NoopGeneration(Generation):
-    def finish(self, reply, *, action=None, action_error=None) -> None:
+    def finish(
+        self, reply, *, action=None, action_error=None, action_count=None, ignored_actions=None
+    ) -> None:
         pass
 
     def error(self, message, attempts=None) -> None:
@@ -217,7 +225,9 @@ class _LangfuseGeneration(Generation):
         metadata.update({key: value for key, value in extra.items() if value is not None})
         return metadata
 
-    def finish(self, reply, *, action=None, action_error=None) -> None:
+    def finish(
+        self, reply, *, action=None, action_error=None, action_count=None, ignored_actions=None
+    ) -> None:
         self._span.update(
             output=reply.content,
             model=reply.response_model or self._request_model,
@@ -229,6 +239,8 @@ class _LangfuseGeneration(Generation):
                 attempts=getattr(reply, "attempts", 1),
                 action=action,
                 action_error=action_error,
+                action_count=action_count,
+                ignored_actions=ignored_actions,
             ),
         )
         self._span.end()

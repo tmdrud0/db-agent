@@ -34,6 +34,7 @@ from agent.tools import (
     TOOL_COSTS,
     ActionError,
     parse_action,
+    parse_response,
     tool_metadata,
 )
 
@@ -77,6 +78,24 @@ PHASE2_PASS = {
 
 def action(tool: str, **args) -> str:
     return json.dumps({"action": tool, "args": args})
+
+
+DSML = "<\uff5c\uff5cDSML\uff5c\uff5c"
+DSML_END = "</\uff5c\uff5cDSML\uff5c\uff5c"
+
+
+def dsml_invoke(name: str, arguments: str | None = None) -> str:
+    lines = [f'{DSML} invoke name="{name}">']
+    if arguments is not None:
+        lines.append(
+            f'{DSML} parameter name="args" string="false">{arguments}{DSML_END} parameter>'
+        )
+    lines.append(f"{DSML_END} invoke>")
+    return "\n".join(lines)
+
+
+def dsml_calls(*invokes: str) -> str:
+    return "\n".join([f"{DSML} calls>", *invokes, f"{DSML_END} calls>"])
 
 
 def model_reply(content: str, finish_reason: str = "stop") -> dict:
@@ -195,6 +214,111 @@ class ActionParsingTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIsInstance(parse_action(content), tuple)
 
+    def test_several_actions_in_one_response_use_the_first(self):
+        first = action("get_schema")
+        other = action("get_all_column_meanings")
+        cases = {
+            "same fenced json": (f'{first}\n```json\n{first}\n```', 2, 0),
+            "same json twice": (f"{first}\n\n{first}", 2, 0),
+            "different json actions": (f"{first}\n{other}", 2, 1),
+            "json and the same dsml": (
+                f"{first}\n{dsml_calls(dsml_invoke('get_schema'))}", 2, 0
+            ),
+            "json and another dsml": (
+                f"{first}\n{dsml_calls(dsml_invoke('get_all_column_meanings'))}", 2, 1
+            ),
+        }
+        for name, (content, action_count, ignored) in cases.items():
+            with self.subTest(name=name):
+                parsed = parse_response(content)
+                self.assertEqual((parsed.name, parsed.args), ("get_schema", {}))
+                self.assertEqual(
+                    (parsed.action_count, parsed.ignored_actions), (action_count, ignored)
+                )
+                self.assertEqual(parse_action(content), ("get_schema", {}))
+
+    def test_braces_and_action_words_inside_string_values_are_one_action(self):
+        sql = "SELECT '{\"action\": \"get_schema\", \"args\": {}}' AS payload;"
+        parsed = parse_response(action("execute_sql", sql=sql))
+        self.assertEqual((parsed.name, parsed.args), ("execute_sql", {"sql": sql}))
+        self.assertEqual((parsed.action_count, parsed.ignored_actions), (1, 0))
+
+    def test_dsml_only_responses_are_read_from_the_first_invoke(self):
+        cases = {
+            "arguments": (
+                dsml_calls(dsml_invoke("execute_sql", '{"sql": "SELECT 1;"}')),
+                ("execute_sql", {"sql": "SELECT 1;"}),
+                1,
+                0,
+            ),
+            "no arguments": (
+                dsml_calls(dsml_invoke("get_schema")),
+                ("get_schema", {}),
+                1,
+                0,
+            ),
+            "named arguments": (
+                dsml_calls(
+                    f'{DSML} invoke name="execute_sql">\n'
+                    f'{DSML} parameter name="sql">SELECT 1;{DSML_END} parameter>\n'
+                    f"{DSML_END} invoke>"
+                ),
+                ("execute_sql", {"sql": "SELECT 1;"}),
+                1,
+                0,
+            ),
+            "multiple invokes": (
+                dsml_calls(
+                    dsml_invoke("get_schema"), dsml_invoke("get_all_column_meanings")
+                ),
+                ("get_schema", {}),
+                2,
+                1,
+            ),
+        }
+        for name, (content, expected, action_count, ignored) in cases.items():
+            with self.subTest(name=name):
+                parsed = parse_response(content)
+                self.assertEqual((parsed.name, parsed.args), expected)
+                self.assertEqual(
+                    (parsed.action_count, parsed.ignored_actions), (action_count, ignored)
+                )
+
+    def test_malformed_dsml_only_responses_are_rejected_with_json_guidance(self):
+        cases = {
+            "unclosed name attribute": (
+                f'{DSML} calls>\n{DSML} invoke name="get_all_knowledge_definitions"}}\n\n'
+            ),
+            "arguments in the opening tag": (
+                f'{DSML} calls>\n{DSML} invoke name="get_all_external_knowledge_names", '
+                '"args": {}}'
+            ),
+            "arguments are not a JSON object": dsml_calls(
+                dsml_invoke("execute_sql", '"SELECT 1;"')
+            ),
+            "arguments are a list": dsml_calls(dsml_invoke("execute_sql", "[1]")),
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name), self.assertRaises(ActionError) as caught:
+                parse_action(content)
+            self.assertIn('{"action"', str(caught.exception))
+            self.assertIn("JSON", str(caught.exception))
+
+    def test_an_invalid_first_action_is_not_replaced_by_a_later_valid_one(self):
+        cases = {
+            "json without an action": (
+                '{"args": {"sql": "SELECT 1;"}}\n' + action("get_schema")
+            ),
+            "unknown first action": action("drop_table") + "\n" + action("get_schema"),
+            "invalid first arguments": (
+                '{"action": "get_column_meaning", "args": {"table_name": "t"}}\n'
+                + action("get_schema")
+            ),
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name), self.assertRaises(ActionError):
+                parse_action(content)
+
     def test_the_two_new_tools_are_accepted_and_unknown_actions_are_rejected(self):
         self.assertEqual(
             parse_action(action("execute_sql", sql="SELECT 1;")),
@@ -261,6 +385,57 @@ class ActionParsingTests(unittest.TestCase):
         self.assertEqual(
             tool_metadata(),
             [{"name": name, "cost": cost} for name, cost in TOOL_COSTS.items()],
+        )
+
+
+class ExecuteSqlStatementTests(unittest.TestCase):
+    """execute_sql accepts one statement and rejects several before any call."""
+
+    def test_multiple_statements_are_rejected_with_the_count_and_guidance(self):
+        for sql in ("SELECT 1; SELECT 2", "SELECT 1; SELECT 2;"):
+            with self.subTest(sql=sql), self.assertRaises(ActionError) as caught:
+                parse_action(action("execute_sql", sql=sql))
+            message = str(caught.exception)
+            self.assertIn("2 statements", message)
+            self.assertIn("UNION ALL", message)
+
+    def test_semicolons_inside_sql_tokens_do_not_split_statements(self):
+        allowed = (
+            "SELECT 1",
+            "SELECT 1;",
+            "SELECT 1; -- note",
+            "SELECT 1; /* note */",
+            "SELECT ';'",
+            "SELECT E'a;b'",
+            'SELECT "a;b" FROM t',
+            "SELECT $$;$$",
+            "SELECT $x$;$x$",
+            "SELECT 1 /* ; /* ; */ */",
+        )
+        for sql in allowed:
+            with self.subTest(sql=sql):
+                self.assertEqual(
+                    parse_action(action("execute_sql", sql=sql)),
+                    ("execute_sql", {"sql": sql}),
+                )
+
+    def test_ambiguous_regions_keep_the_current_behavior(self):
+        for sql in (
+            "SELECT 'unterminated",
+            "SELECT 1; /* unterminated",
+            "SELECT $$unterminated",
+            "SELECT E'a\\'b; SELECT 2",
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual(
+                    parse_action(action("execute_sql", sql=sql)),
+                    ("execute_sql", {"sql": sql}),
+                )
+
+    def test_submit_sql_is_not_limited_to_one_statement(self):
+        sql = "SELECT 1; SELECT 2;"
+        self.assertEqual(
+            parse_action(action("submit_sql", sql=sql)), ("submit_sql", {"sql": sql})
         )
 
 
@@ -993,6 +1168,75 @@ class ExploreAndAskTests(ToolLoopTestCase):
         self.assertIn(USER_ANSWER, feedback)
         self.assertIn("[action 3 | phase 2 | ask_user | cost 2 |", feedback)
         self.assertTrue(state["task_done"])
+
+
+class MultipleActionAndStatementTests(ToolLoopTestCase):
+    """Accepted multi-action responses and rejected multi-statement exploration."""
+
+    def test_only_the_first_of_several_actions_runs_and_the_rest_are_noticed(self):
+        content = action("get_schema") + "\n\n" + action("get_all_column_meanings")
+        self.actions = [content, action("submit_sql", sql="SELECT 1;")]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/schema", "/submit"])
+        self.assertEqual(self.trajectory(state), [("get_schema", 1.0), ("submit_sql", 3.0)])
+        self.assertEqual(state["budget_remaining"], 14)
+        event = state["adk_events"][0]
+        self.assertEqual(event["action"]["name"], "get_schema")
+        self.assertEqual(event["action_count"], 2)
+        self.assertEqual(event["ignored_actions"], 1)
+        feedback = self.model_requests[1]["messages"][-1]["content"]
+        self.assertIn("contained 2 actions", feedback)
+        self.assertIn("only the first", feedback)
+        self.assertIn("Send exactly one action per response", feedback)
+
+    def test_a_repeated_identical_action_is_not_announced(self):
+        same = action("get_schema")
+        self.actions = [
+            f"{same}\n```json\n{same}\n```", action("submit_sql", sql="SELECT 1;")
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/schema", "/submit"])
+        event = state["adk_events"][0]
+        self.assertEqual(event["action_count"], 2)
+        self.assertNotIn("ignored_actions", event)
+        feedback = self.model_requests[1]["messages"][-1]["content"]
+        self.assertNotIn("contained 2 actions", feedback)
+
+    def test_dsml_only_response_runs_its_first_invoke(self):
+        self.actions = [
+            dsml_calls(dsml_invoke("get_schema")),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/schema", "/submit"])
+        self.assertEqual(state["adk_events"][0]["action"]["name"], "get_schema")
+        self.assertEqual(state["budget_remaining"], 14)
+
+    def test_multiple_statement_execute_sql_is_rejected_without_a_service_call(self):
+        sql = "SELECT 1; SELECT 2;"
+        self.actions = [
+            action("execute_sql", sql=sql), action("submit_sql", sql="SELECT 1;")
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/submit"])
+        self.assertEqual(self.trajectory(state), [("submit_sql", 3.0)])
+        self.assertEqual(state["budget_remaining"], 15)
+        self.assertEqual(state["tool_trajectory"][0]["budget_before"], 18)
+        event = state["adk_events"][0]
+        self.assertIsNone(event["action"])
+        self.assertIn("2 statements", event["action_error"])
+        rejected = self.model_requests[1]["messages"][-1]["content"]
+        self.assertIn("rejected", rejected)
+        self.assertIn("| cost 0 |", rejected)
+        self.assertIn("budget 18]", rejected)
 
 
 class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
