@@ -19,6 +19,7 @@ from agent.tools import tool_metadata
 from agent.tracing import (
     FLUSH_TIMEOUT_SECONDS,
     SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
+    NoopTracer,
     Tracer,
     create_tracer,
 )
@@ -63,22 +64,30 @@ def create_app(
         )
     environment = environment or Environment()
     model = model or ModelClient()
-    tracer = tracer if tracer is not None else create_tracer(
-        agent_name=AGENT_NAME, model_id=MODEL_ID
-    )
+    # The real client is created by the lifespan startup, not here: a test
+    # app built without a lifespan must never reach Langfuse just because the
+    # shell inherited keys from a previous evaluation run.
+    fallback_tracer = NoopTracer()
+    live_tracer: Tracer | None = tracer
     sessions: dict[tuple[str, str], Session] = {}
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        nonlocal live_tracer
+        if live_tracer is None:
+            live_tracer = create_tracer(agent_name=AGENT_NAME, model_id=MODEL_ID)
         try:
             yield
         finally:
-            # The runner normally stops the server with Stop-Process, so each
-            # session also flushes before its response; this covers clean exits.
-            try:
-                await tracer.flush(SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
-            except Exception:
-                pass
+            active = live_tracer
+            if active is not None:
+                # The runner normally stops the server with Stop-Process, so
+                # each session also flushes before its response; this covers
+                # clean exits.
+                try:
+                    await active.flush(SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
+                except Exception:
+                    pass
 
     app = FastAPI(title=f"BIRD custom agent: {AGENT_NAME}", lifespan=lifespan)
 
@@ -121,10 +130,11 @@ def create_app(
         session = sessions.get((req.mode, req.task_id))
         if session is None:
             raise HTTPException(404, "Call /init_session first")
+        active_tracer = live_tracer or fallback_tracer
         async with session.lock:
             try:
                 response = await run_tool_loop(
-                    session.state, req.message, environment, model, tracer
+                    session.state, req.message, environment, model, active_tracer
                 )
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc
@@ -145,7 +155,7 @@ def create_app(
                 # session is sent before the response can leave. A slow or
                 # failing Langfuse call never changes the response.
                 try:
-                    await tracer.flush(FLUSH_TIMEOUT_SECONDS)
+                    await active_tracer.flush(FLUSH_TIMEOUT_SECONDS)
                 except Exception:
                     pass
 

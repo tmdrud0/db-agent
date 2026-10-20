@@ -426,16 +426,108 @@ class FlushTests(TracingSessionTestCase):
         self.grader_payloads = [dict(PHASE1_FOLLOW_UP), dict(PHASE2_PASS)]
         self.actions.append(action("submit_sql", sql="SELECT 2;"))
         self.langfuse.flush_delay = 0.4
-        with mock.patch.object(server_module, "FLUSH_TIMEOUT_SECONDS", 0.05), \
-                mock.patch.object(tool_loop, "_now", lambda: 1000.0):
+        with mock.patch.object(server_module, "FLUSH_TIMEOUT_SECONDS", 0.05):
             with TestClient(self.app()) as client:
                 started = time.monotonic()
                 response = self.run_session(client)
                 wall_seconds = time.monotonic() - started
         self.assertEqual(response.status_code, 200, response.text)
         self.assertLess(wall_seconds, 0.35)
-        self.assertEqual(response.json()["state"]["session_elapsed_seconds"], 0.0)
+        self.assertLess(response.json()["state"]["session_elapsed_seconds"], 0.2)
         self.assertEqual(self.langfuse.flush_calls, 2)
+
+
+class StepClock:
+    def __init__(self, value: float = 1000.0, step: float = 0.01):
+        self.value = value
+        self.step = step
+
+    def __call__(self) -> float:
+        current = self.value
+        self.value += self.step
+        return current
+
+
+class FlushParityTests(TracingSessionTestCase):
+    SCRIPT = (
+        action("submit_sql", sql="SELECT count(*) FROM customers;"),
+        action("submit_sql", sql="SELECT count(*) FROM customers WHERE id > 0;"),
+    )
+    GRADER = (dict(PHASE1_FOLLOW_UP), dict(PHASE2_PASS))
+
+    def run_scenario(self, tracer, *, model_status=200, grader_status=200):
+        self.actions = list(self.SCRIPT)
+        self.grader_payloads = [dict(payload) for payload in self.GRADER]
+        self.model_status = model_status
+        self.grader_status = grader_status
+        with mock.patch.object(tool_loop, "_now", StepClock()):
+            with TestClient(self.app(tracer=tracer)) as client:
+                return self.run_session(client)
+
+    @staticmethod
+    def without_session_id(response):
+        body = response.json()
+        body.pop("session_id", None)
+        return body
+
+    @staticmethod
+    def failing_flush_tracer():
+        tracer, client = recording_tracer()
+        client.flush_error = RuntimeError("network down")
+        return tracer
+
+    def test_flush_failure_keeps_the_success_response_and_state_identical(self):
+        without = self.run_scenario(NoopTracer())
+        with_failure = self.run_scenario(self.failing_flush_tracer())
+        self.assertEqual(without.status_code, with_failure.status_code)
+        self.assertEqual(
+            self.without_session_id(without), self.without_session_id(with_failure)
+        )
+
+    def test_flush_delay_keeps_the_success_response_and_state_identical(self):
+        without = self.run_scenario(NoopTracer())
+        traced, client = recording_tracer()
+        client.flush_delay = 0.2
+        with mock.patch.object(server_module, "FLUSH_TIMEOUT_SECONDS", 0.05):
+            with_delay = self.run_scenario(traced)
+        self.assertEqual(without.status_code, with_delay.status_code)
+        self.assertEqual(
+            self.without_session_id(without), self.without_session_id(with_delay)
+        )
+
+    def test_flush_failure_keeps_a_model_error_response_identical(self):
+        without = self.run_scenario(NoopTracer(), model_status=500)
+        with_failure = self.run_scenario(self.failing_flush_tracer(), model_status=500)
+        self.assertEqual(without.status_code, 502)
+        self.assertEqual(without.json(), with_failure.json())
+
+    def test_flush_delay_keeps_a_model_error_response_identical(self):
+        without = self.run_scenario(NoopTracer(), model_status=500)
+        traced, client = recording_tracer()
+        client.flush_delay = 0.2
+        with mock.patch.object(server_module, "FLUSH_TIMEOUT_SECONDS", 0.05):
+            with_delay = self.run_scenario(traced, model_status=500)
+        self.assertEqual(without.status_code, 502)
+        self.assertEqual(without.json(), with_delay.json())
+
+    def test_flush_failure_keeps_a_grader_error_response_identical(self):
+        without = self.run_scenario(NoopTracer(), grader_status=500)
+        with_failure = self.run_scenario(self.failing_flush_tracer(), grader_status=500)
+        self.assertEqual(without.status_code, 502)
+        self.assertEqual(without.json(), with_failure.json())
+
+    def test_a_completed_flush_is_not_part_of_the_session_elapsed_time(self):
+        self.actions = list(self.SCRIPT)
+        self.grader_payloads = [dict(payload) for payload in self.GRADER]
+        self.langfuse.flush_delay = 0.6
+        with mock.patch.object(server_module, "FLUSH_TIMEOUT_SECONDS", 2.0):
+            with TestClient(self.app()) as client:
+                started = time.monotonic()
+                response = self.run_session(client)
+                wall_seconds = time.monotonic() - started
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertGreaterEqual(wall_seconds, 0.5)
+        self.assertLess(response.json()["state"]["session_elapsed_seconds"], 0.5)
 
 
 class DisabledTracingTests(unittest.TestCase):
@@ -552,6 +644,68 @@ class DisabledTracingTests(unittest.TestCase):
             [event["action"] for event in left["adk_events"]],
             [event["action"] for event in right["adk_events"]],
         )
+
+
+class ServerTracerLifecycleTests(TracingSessionTestCase):
+    def test_a_test_app_without_lifespan_never_creates_a_langfuse_client(self):
+        self.actions = [
+            action("submit_sql", sql="SELECT 1;"),
+            action("submit_sql", sql="SELECT 2;"),
+        ]
+        self.grader_payloads = [dict(PHASE1_FOLLOW_UP), dict(PHASE2_PASS)]
+        environment = {
+            "LANGFUSE_PUBLIC_KEY": "fake-public",
+            "LANGFUSE_SECRET_KEY": "fake-secret",
+        }
+        with mock.patch.dict(os.environ, environment), mock.patch.object(
+            server_module, "create_tracer", side_effect=AssertionError("must not create")
+        ):
+            app = create_app(
+                Environment(httpx.MockTransport(self.service_handler)),
+                ModelClient(
+                    transport=httpx.MockTransport(self.model_handler), api_key="test-key"
+                ),
+                mode="tools",
+            )
+            client = TestClient(app)
+            response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["state"]["stop_reason"], "phase2_completed")
+
+    def test_lifespan_startup_creates_the_client_once_and_uses_it(self):
+        self.actions = [
+            action("submit_sql", sql="SELECT 1;"),
+            action("submit_sql", sql="SELECT 2;"),
+        ]
+        self.grader_payloads = [dict(PHASE1_FOLLOW_UP), dict(PHASE2_PASS)]
+        tracer, langfuse = recording_tracer()
+        app = create_app(
+            Environment(httpx.MockTransport(self.service_handler)),
+            ModelClient(
+                transport=httpx.MockTransport(self.model_handler), api_key="test-key"
+            ),
+            mode="tools",
+        )
+        with mock.patch.object(
+            server_module, "create_tracer", return_value=tracer
+        ) as factory:
+            with TestClient(app) as client:
+                response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(factory.call_count, 1)
+        self.assertEqual(len(langfuse.roots), 1)
+
+    def test_an_injected_tracer_is_not_replaced_by_the_lifespan(self):
+        self.actions = [action("submit_sql", sql="SELECT 1;")]
+        self.grader_payloads = [dict(PHASE1_FOLLOW_UP), dict(PHASE2_PASS)]
+        self.actions.append(action("submit_sql", sql="SELECT 2;"))
+        with mock.patch.object(
+            server_module, "create_tracer", side_effect=AssertionError("must not create")
+        ):
+            with TestClient(self.app(tracer=self.tracer)) as client:
+                response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.langfuse.roots), 1)
 
 
 class TracerConstructionTests(unittest.TestCase):
