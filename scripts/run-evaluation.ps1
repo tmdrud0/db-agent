@@ -4,7 +4,6 @@ param(
     [string]$DataPath = '',
     [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$ResultName = 'deepseek_v41_flash_two_phase',
     [ValidatePattern('^[A-Za-z0-9_-]+$')][string]$OracleResultName = 'oracle_smoke',
-    [ValidateSet('fixed', 'tools')][string]$AgentMode = 'fixed',
     [switch]$Calibrated
 )
 
@@ -24,18 +23,14 @@ $env:PYTHONUTF8 = '1'
 $env:DATASET = 'lite'
 $env:DB_ENV_URL = 'http://127.0.0.1:6002'
 $env:USER_SIM_URL = 'http://127.0.0.1:6001'
-# Health values reported by the selected agent mode (agent/server.py).
-$agentNames = @{
-    fixed = 'deepseek-v4.1-flash-fixed-context-two-phase'
-    tools = 'deepseek-v4.1-flash-tool-selecting-two-phase'
-}
-$agentName = $agentNames[$AgentMode]
+# Health values reported by the agent service (agent/server.py).
+$agentName = 'deepseek-v4.1-flash-tool-selecting-two-phase'
 $modelId = 'deepseek/deepseek-v4.1-flash'
 $agentUrl = 'http://127.0.0.1:6000'
 $simulatorUrl = 'http://127.0.0.1:6001'
-# The tools mode offers the nine official tools with their official prices.
+# The agent offers the nine official tools with their official prices.
 # /health reports the real tool set, so a stale service that only shares the
-# mode name (the previous seven-tool version) is rejected instead of reused.
+# name (for example the previous seven-tool version) is rejected instead of reused.
 $expectedTools = [ordered]@{
     get_schema = 1.0
     get_all_column_meanings = 1.0
@@ -84,34 +79,31 @@ function Wait-Service([string]$Url) {
     throw "Service did not become ready: $Url"
 }
 
-# A reused or freshly started agent must be the intended two-phase agent for
-# the requested mode, not a stale server with a different model or settings.
-function Assert-BaselineAgent([string]$Url, [string]$Mode) {
+# A reused or freshly started agent must be the tool-selecting two-phase
+# agent, not a stale server with a different model or tool set.
+function Assert-BaselineAgent([string]$Url) {
     $info = Invoke-RestMethod -Uri "$Url/health" -TimeoutSec 5
-    if ($info.service -ne 'system_agent' -or $info.mode -ne $Mode -or
+    if ($info.service -ne 'system_agent' -or $info.mode -ne 'tools' -or
         $info.agent -ne $agentName -or $info.model -ne $modelId) {
-        throw "Port 6000 is not the '$Mode' two-phase agent ($agentName / $modelId). Stop that service before evaluation."
+        throw "Port 6000 is not the tool-selecting two-phase agent ($agentName / $modelId). Stop that service before evaluation."
     }
-    if ($Mode -eq 'tools') {
-        $reported = @{}
-        foreach ($tool in @($info.tools)) { $reported[[string]$tool.name] = [double]$tool.cost }
-        if ($reported.Count -ne $expectedTools.Count) {
-            throw "The tools agent offers $($reported.Count) tool(s) instead of $($expectedTools.Count). Restart port 6000 with the current code."
-        }
-        foreach ($name in $expectedTools.Keys) {
-            if (!$reported.ContainsKey($name) -or $reported[$name] -ne [double]$expectedTools[$name]) {
-                throw "The tools agent does not offer '$name' at the official price. Restart port 6000 with the current code."
-            }
+    $reported = @{}
+    foreach ($tool in @($info.tools)) { $reported[[string]$tool.name] = [double]$tool.cost }
+    if ($reported.Count -ne $expectedTools.Count) {
+        throw "The agent offers $($reported.Count) tool(s) instead of $($expectedTools.Count). Restart port 6000 with the current code."
+    }
+    foreach ($name in $expectedTools.Keys) {
+        if (!$reported.ContainsKey($name) -or $reported[$name] -ne [double]$expectedTools[$name]) {
+            throw "The agent does not offer '$name' at the official price. Restart port 6000 with the current code."
         }
     }
 }
 
-# The tools mode asks the simulator real questions, so the running simulator
+# The agent asks the simulator real questions, so the running simulator
 # must report the Command Code connection instead of the vendor's default
 # Anthropic model without a key.
-function Assert-Simulator([string]$Url, [string]$Mode) {
+function Assert-Simulator([string]$Url) {
     $info = Invoke-RestMethod -Uri "$Url/health" -TimeoutSec 5
-    if ($Mode -ne 'tools') { return }
     if ($info.service -ne 'user_simulator_command_code' -or $info.model -ne $modelId -or
         $info.prompt_version -ne 'v2' -or [int]$info.max_retries -ne 0 -or
         [double]$info.max_output_tokens -ne 16384 -or !$info.api_key_present) {
@@ -150,25 +142,24 @@ try {
     Wait-Service 'http://127.0.0.1:6002/health'
     Wait-Service 'http://127.0.0.1:6001/health'
     Assert-Calibration $Calibrated
-    Assert-Simulator $simulatorUrl $AgentMode
+    Assert-Simulator $simulatorUrl
 
-    # Reuse a running agent only when it reports the requested mode.
+    # Reuse a running agent only when it reports the current tool set.
     $existingAgent = $null
     try { $existingAgent = Invoke-RestMethod "$agentUrl/health" -TimeoutSec 2 } catch { }
     if ($existingAgent) {
-        Assert-BaselineAgent $agentUrl $AgentMode
+        Assert-BaselineAgent $agentUrl
     } else {
         if (-not $env:CMD_API_KEY) {
             throw 'CMD_API_KEY is missing. Set it in the project .env file or the current PowerShell environment.'
         }
-        $env:AGENT_MODE = $AgentMode
         $agentProcess = Start-Process -FilePath $pythonExe -WindowStyle Hidden -PassThru `
             -ArgumentList '-m', 'uvicorn', 'agent.server:app', '--host', '127.0.0.1', '--port', '6000' `
             -WorkingDirectory $projectRoot `
             -RedirectStandardOutput (Join-Path $runtimeDir 'agent.stdout.log') `
             -RedirectStandardError (Join-Path $runtimeDir 'agent.stderr.log')
         Wait-Service "$agentUrl/health"
-        Assert-BaselineAgent $agentUrl $AgentMode
+        Assert-BaselineAgent $agentUrl
     }
 
     Push-Location $benchmarkRoot

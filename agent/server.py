@@ -11,20 +11,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.environment import Environment, GradingError
-from agent.loop import InputError, run
 from agent.model import MODEL_ID, ModelClient, ModelError
+from agent.session import InputError
 from agent.tool_loop import run as run_tool_loop
 from agent.tools import tool_metadata
 
-# Each mode is selected explicitly (AGENT_MODE or create_app) and reported by /health.
-AGENT_NAMES = {
-    "fixed": "deepseek-v4.1-flash-fixed-context-two-phase",
-    "tools": "deepseek-v4.1-flash-tool-selecting-two-phase",
-}
-DEFAULT_MODE = "fixed"
-AGENT_NAME = AGENT_NAMES[DEFAULT_MODE]
-
-RUNNERS = {"fixed": run, "tools": run_tool_loop}
+AGENT_NAME = "deepseek-v4.1-flash-tool-selecting-two-phase"
+SUPPORTED_MODE = "tools"
 
 
 class InitRequest(BaseModel):
@@ -52,12 +45,15 @@ def create_app(
     model: ModelClient | None = None,
     mode: str | None = None,
 ) -> FastAPI:
-    selected = (mode or os.getenv("AGENT_MODE") or DEFAULT_MODE).strip().lower()
-    if selected not in AGENT_NAMES:
+    # The tool-selecting loop is the only agent. An explicit request for a
+    # removed mode must fail instead of silently running a different agent.
+    selected = (mode if mode is not None else os.getenv("AGENT_MODE", "")).strip().lower()
+    selected = selected or SUPPORTED_MODE
+    if selected != SUPPORTED_MODE:
         raise ValueError(
-            f"Unknown agent mode '{selected}'; expected one of {', '.join(AGENT_NAMES)}"
+            f"Unknown agent mode '{selected}'; only '{SUPPORTED_MODE}' is supported"
         )
-    app = FastAPI(title=f"BIRD custom agent: {AGENT_NAMES[selected]}")
+    app = FastAPI(title=f"BIRD custom agent: {AGENT_NAME}")
     environment = environment or Environment()
     model = model or ModelClient()
     sessions: dict[tuple[str, str], Session] = {}
@@ -67,12 +63,12 @@ def create_app(
         return {
             "status": "healthy",
             "service": "system_agent",
-            "agent": AGENT_NAMES[selected],
-            "mode": selected,
+            "agent": AGENT_NAME,
+            "mode": SUPPORTED_MODE,
             "model": MODEL_ID,
-            # A tools service is identified by its real tool set, so a stale
-            # service with a different tool set cannot be reused by name alone.
-            "tools": tool_metadata() if selected == "tools" else [],
+            # The real tool set identifies the service, so a stale server that
+            # only shares the name cannot be reused by the evaluator.
+            "tools": tool_metadata(),
             "execute_sql_timeout_seconds": environment.execute_sql_timeout,
             "ask_user_timeout_seconds": environment.ask_user_timeout,
         }
@@ -103,7 +99,7 @@ def create_app(
             raise HTTPException(404, "Call /init_session first")
         async with session.lock:
             try:
-                response = await RUNNERS[selected](session.state, req.message, environment, model)
+                response = await run_tool_loop(session.state, req.message, environment, model)
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc
             except ModelError as exc:

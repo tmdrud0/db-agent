@@ -17,7 +17,7 @@ from agent.environment import (
     GradingError,
 )
 from agent.model import API_URL, MAX_OUTPUT_TOKENS, MODEL_ID, ModelClient, ModelError
-from agent.server import AGENT_NAMES, create_app
+from agent.server import AGENT_NAME, create_app
 from agent.tool_loop import MAX_MODEL_ACTIONS, submission_key
 from agent.tools import (
     ALLOWED_TOOLS,
@@ -427,27 +427,32 @@ class ToolLoopTestCase(unittest.TestCase):
 
 
 class ToolLoopContractTests(ToolLoopTestCase):
-    def test_health_reports_the_selected_mode(self):
-        for mode, name in AGENT_NAMES.items():
-            with self.subTest(mode=mode):
-                health = TestClient(create_app(mode=mode)).get("/health").json()
-                self.assertEqual(health["status"], "healthy")
-                self.assertEqual(health["service"], "system_agent")
-                self.assertEqual(health["agent"], name)
-                self.assertEqual(health["mode"], mode)
-                self.assertEqual(health["model"], MODEL_ID)
-                expected_tools = tool_metadata() if mode == "tools" else []
-                self.assertEqual(health["tools"], expected_tools)
-                self.assertEqual(health["execute_sql_timeout_seconds"], EXECUTE_SQL_TIMEOUT_SECONDS)
-                self.assertEqual(health["ask_user_timeout_seconds"], ASK_USER_TIMEOUT_SECONDS)
+    def test_health_reports_the_tool_selecting_agent(self):
+        health = TestClient(create_app()).get("/health").json()
+        self.assertEqual(health["status"], "healthy")
+        self.assertEqual(health["service"], "system_agent")
+        self.assertEqual(health["agent"], AGENT_NAME)
+        self.assertEqual(health["mode"], "tools")
+        self.assertEqual(health["model"], MODEL_ID)
+        self.assertEqual(health["tools"], tool_metadata())
+        self.assertEqual(health["execute_sql_timeout_seconds"], EXECUTE_SQL_TIMEOUT_SECONDS)
+        self.assertEqual(health["ask_user_timeout_seconds"], ASK_USER_TIMEOUT_SECONDS)
 
         with mock.patch.dict(os.environ, {"AGENT_MODE": "tools"}):
             self.assertEqual(TestClient(create_app()).get("/health").json()["mode"], "tools")
         with mock.patch.dict(os.environ, {"AGENT_MODE": ""}):
-            self.assertEqual(TestClient(create_app()).get("/health").json()["mode"], "fixed")
-        with mock.patch.dict(os.environ, {"AGENT_MODE": "unknown"}):
-            with self.assertRaises(ValueError):
-                create_app()
+            self.assertEqual(TestClient(create_app()).get("/health").json()["mode"], "tools")
+
+    def test_removed_modes_are_rejected_instead_of_silently_running_tools(self):
+        for removed in ("fixed", "unknown"):
+            with self.subTest(mode=removed), self.assertRaises(ValueError) as caught:
+                create_app(mode=removed)
+            self.assertIn(removed, str(caught.exception))
+            self.assertIn("tools", str(caught.exception))
+            with self.subTest(env=removed):
+                with mock.patch.dict(os.environ, {"AGENT_MODE": removed}):
+                    with self.assertRaises(ValueError):
+                        create_app()
 
     def test_each_allowed_tool_uses_its_official_endpoint_and_price(self):
         execute_sql = "SELECT count(*) FROM customers;"
@@ -1330,10 +1335,13 @@ class ToolLoopConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.model_requests = []
         self.service_paths = []
+        self.model_status = 200
 
         async def model_handler(request):
             self.model_requests.append(json.loads(request.content))
             await asyncio.sleep(0.05)
+            if self.model_status != 200:
+                return httpx.Response(self.model_status, json={"error": {"message": "boom"}})
             return httpx.Response(200, json=model_reply(action("submit_sql", sql="SELECT 1;")))
 
         async def service_handler(request):
@@ -1371,6 +1379,18 @@ class ToolLoopConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service_paths, ["/submit"])
         self.assertEqual(responses[0].json()["response"], responses[1].json()["response"])
         self.assertTrue(responses[0].json()["state"]["task_done"])
+
+    async def test_simultaneous_requests_after_a_model_failure_do_not_retry(self):
+        self.model_status = 500
+        await self.initialize()
+        payload = {"task_id": "test-task", "mode": "a-interact", "message": "Answer."}
+        responses = await asyncio.gather(
+            self.client.post("/run_session", json=payload),
+            self.client.post("/run_session", json=payload),
+        )
+        self.assertEqual([response.status_code for response in responses], [502, 502])
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual(self.service_paths, [])
 
 
 if __name__ == "__main__":

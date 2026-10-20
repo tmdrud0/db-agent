@@ -1,4 +1,4 @@
-"""Session state helpers shared by the fixed and the tool-selecting loops."""
+"""Session state helpers for the tool-selecting loop."""
 
 from agent.environment import GradingError
 from agent.model import ModelError

@@ -1,4 +1,4 @@
-"""Model HTTP contract checks with a mocked provider; these are not scores."""
+"""Model chat HTTP contract checks with a mocked provider; these are not scores."""
 
 import json
 import os
@@ -7,14 +7,7 @@ from unittest import mock
 
 import httpx
 
-from agent.model import (
-    API_URL,
-    MAX_OUTPUT_TOKENS,
-    MODEL_ID,
-    ModelClient,
-    ModelError,
-    extract_sql,
-)
+from agent.model import API_URL, MAX_OUTPUT_TOKENS, MODEL_ID, ModelClient, ModelError
 
 
 def provider_reply(content: str = "SELECT 1;", finish_reason: str = "stop") -> dict:
@@ -25,27 +18,7 @@ def provider_reply(content: str = "SELECT 1;", finish_reason: str = "stop") -> d
     }
 
 
-class ExtractSqlTests(unittest.TestCase):
-    def test_plain_sql_is_kept_and_outer_whitespace_is_trimmed(self):
-        self.assertEqual(extract_sql("  SELECT 1;\n"), "SELECT 1;")
-
-    def test_single_code_fence_wrapping_the_whole_response_is_removed(self):
-        self.assertEqual(extract_sql("```sql\nSELECT 1;\n```"), "SELECT 1;")
-        self.assertEqual(extract_sql("```\nSELECT 1;\n```"), "SELECT 1;")
-
-    def test_only_a_fence_wrapping_the_whole_response_is_removed(self):
-        inline = "SELECT '```' AS marker"
-        self.assertEqual(extract_sql(inline), inline)
-        trailing = "```\nSELECT 1;\n```\nSELECT 2;"
-        self.assertEqual(extract_sql(trailing), trailing)
-
-    def test_empty_content_and_empty_fence_are_errors(self):
-        for content in ("", "   ", "```\n```", "```sql\n```"):
-            with self.subTest(content=content), self.assertRaises(ModelError):
-                extract_sql(content)
-
-
-class ModelRequestTests(unittest.IsolatedAsyncioTestCase):
+class ChatRequestTests(unittest.IsolatedAsyncioTestCase):
     def client(self, handler, **kwargs) -> ModelClient:
         return ModelClient(transport=httpx.MockTransport(handler), **kwargs)
 
@@ -56,8 +29,11 @@ class ModelRequestTests(unittest.IsolatedAsyncioTestCase):
             requests.append(request)
             return httpx.Response(200, json=provider_reply())
 
-        prompt = "Database: demo\n\nUser Query:\nHow many customers?"
-        reply = await self.client(handler, api_key="fake-key").generate_sql(prompt)
+        messages = [
+            {"role": "system", "content": "You are a test."},
+            {"role": "user", "content": "How many customers?"},
+        ]
+        reply = await self.client(handler, api_key="fake-key").chat(messages)
 
         self.assertEqual(len(requests), 1)
         request = requests[0]
@@ -67,17 +43,13 @@ class ModelRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["model"], MODEL_ID)
         self.assertFalse(body["stream"])
         self.assertEqual(body["max_tokens"], MAX_OUTPUT_TOKENS)
-        self.assertEqual([m["role"] for m in body["messages"]], ["system", "user"])
-        system = body["messages"][0]["content"].lower()
-        self.assertIn("postgresql", system)
-        self.assertIn("only", system)
-        self.assertIn("no markdown", system)
-        self.assertEqual(body["messages"][1]["content"], prompt)
+        self.assertEqual(body["messages"], messages)
 
-        self.assertEqual(reply.sql, "SELECT 1;")
+        self.assertEqual(reply.content, "SELECT 1;")
         self.assertEqual(reply.response_model, MODEL_ID)
         self.assertEqual(reply.usage, provider_reply()["usage"])
         self.assertGreaterEqual(reply.elapsed_seconds, 0)
+        self.assertFalse(reply.truncated)
 
     async def test_missing_api_key_fails_before_any_request(self):
         def handler(request):
@@ -85,7 +57,7 @@ class ModelRequestTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.dict(os.environ, {"CMD_API_KEY": ""}):
             with self.assertRaises(ModelError) as caught:
-                await self.client(handler).generate_sql("How many customers?")
+                await self.client(handler).chat([{"role": "user", "content": "q"}])
         self.assertIn("CMD_API_KEY", str(caught.exception))
 
     async def test_model_http_errors_and_timeouts_are_explicit(self):
@@ -93,23 +65,25 @@ class ModelRequestTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(500, json={"error": {"message": "upstream failure"}})
 
         with self.assertRaises(ModelError) as caught:
-            await self.client(failing, api_key="fake-key").generate_sql("q")
+            await self.client(failing, api_key="fake-key").chat([{"role": "user", "content": "q"}])
         self.assertIn("500", str(caught.exception))
 
         def timing_out(request):
             raise httpx.ReadTimeout("timed out")
 
         with self.assertRaises(ModelError) as caught:
-            await self.client(timing_out, api_key="fake-key").generate_sql("q")
+            await self.client(timing_out, api_key="fake-key").chat(
+                [{"role": "user", "content": "q"}]
+            )
         self.assertIn("timed out", str(caught.exception))
 
-    async def test_invalid_or_incomplete_payloads_are_generation_failures(self):
+    async def test_malformed_payloads_are_model_errors(self):
         cases = {
             "invalid json": httpx.Response(200, content=b"<html>not json</html>"),
             "missing choices": httpx.Response(200, json={"model": MODEL_ID}),
+            "empty choices": httpx.Response(200, json={"model": MODEL_ID, "choices": []}),
             "choices not a list": httpx.Response(200, json={"model": MODEL_ID, "choices": {}}),
-            "empty content": httpx.Response(200, json=provider_reply("   ")),
-            "truncated": httpx.Response(200, json=provider_reply("SELECT", "length")),
+            "choice not an object": httpx.Response(200, json={"model": MODEL_ID, "choices": [7]}),
         }
 
         def handler_for(response):
@@ -120,14 +94,38 @@ class ModelRequestTests(unittest.IsolatedAsyncioTestCase):
 
         for name, response in cases.items():
             with self.subTest(name=name), self.assertRaises(ModelError):
-                await self.client(handler_for(response), api_key="fake-key").generate_sql("q")
+                await self.client(handler_for(response), api_key="fake-key").chat(
+                    [{"role": "user", "content": "q"}]
+                )
+
+    async def test_empty_and_truncated_content_are_reported_not_fabricated(self):
+        def handler_for(response):
+            def handler(request):
+                return response
+
+            return handler
+
+        empty = await self.client(
+            handler_for(httpx.Response(200, json=provider_reply("   "))), api_key="fake-key"
+        ).chat([{"role": "user", "content": "q"}])
+        self.assertEqual(empty.content, "   ")
+        self.assertFalse(empty.truncated)
+
+        truncated = await self.client(
+            handler_for(httpx.Response(200, json=provider_reply("SELECT", "length"))),
+            api_key="fake-key",
+        ).chat([{"role": "user", "content": "q"}])
+        self.assertEqual(truncated.content, "SELECT")
+        self.assertTrue(truncated.truncated)
 
     async def test_error_messages_never_contain_the_api_key(self):
         def handler(request):
             raise httpx.ConnectError("connection refused")
 
         with self.assertRaises(ModelError) as caught:
-            await self.client(handler, api_key="fake-secret-key").generate_sql("q")
+            await self.client(handler, api_key="fake-secret-key").chat(
+                [{"role": "user", "content": "q"}]
+            )
         self.assertNotIn("fake-secret-key", str(caught.exception))
 
 

@@ -9,26 +9,13 @@ import httpx
 API_URL = "https://api.commandcode.ai/provider/v1/chat/completions"
 MODEL_ID = "deepseek/deepseek-v4.1-flash"
 REQUEST_TIMEOUT_SECONDS = 300.0
-# The model spends reasoning tokens before writing SQL, so a small cap can
-# truncate the answer before any SQL is produced.
+# The model spends reasoning tokens before writing the action, so a small cap
+# can truncate the response before any action is produced.
 MAX_OUTPUT_TOKENS = 16384
-
-SYSTEM_PROMPT = (
-    "You answer PostgreSQL questions for a benchmark. "
-    "Output only the final SQL statement: no explanation, no markdown, no code fences."
-)
 
 
 class ModelError(RuntimeError):
-    """The model did not return a usable SQL statement."""
-
-
-@dataclass
-class ModelReply:
-    sql: str
-    response_model: str | None
-    usage: dict | None
-    elapsed_seconds: float
+    """The model call did not return a usable response."""
 
 
 @dataclass
@@ -38,16 +25,6 @@ class ChatReply:
     usage: dict | None
     elapsed_seconds: float
     truncated: bool
-
-
-def extract_sql(content: str) -> str:
-    text = content.strip()
-    if text.startswith("```") and text.endswith("```") and text.count("```") == 2:
-        opening_end = text.find("\n")
-        text = "" if opening_end == -1 else text[opening_end + 1 : -3].strip()
-    if not text:
-        raise ModelError("Model response contained no SQL")
-    return text
 
 
 class ModelClient:
@@ -101,22 +78,6 @@ class ModelClient:
             usage=data.get("usage"),
             elapsed_seconds=elapsed,
             truncated=choice.get("finish_reason") == "length",
-        )
-
-    async def generate_sql(self, user_prompt: str) -> ModelReply:
-        reply = await self._complete([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ])
-        if reply.truncated:
-            raise ModelError("Model output was truncated")
-        if not reply.content.strip():
-            raise ModelError("Model response contained no SQL")
-        return ModelReply(
-            sql=extract_sql(reply.content),
-            response_model=reply.response_model,
-            usage=reply.usage,
-            elapsed_seconds=reply.elapsed_seconds,
         )
 
     async def chat(self, messages: list[dict]) -> ChatReply:
