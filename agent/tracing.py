@@ -47,6 +47,18 @@ def _trace_name(agent_name: str, task_id: str) -> str:
     return name.encode("ascii", "replace").decode("ascii")[:200]
 
 
+def _cached_input_tokens(usage: dict, prompt_tokens: int) -> int:
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        return 0
+    cached = details.get("cached_tokens")
+    if not isinstance(cached, int) or isinstance(cached, bool):
+        return 0
+    if not 0 <= cached <= prompt_tokens:
+        return 0
+    return cached
+
+
 def _usage_details(usage: Any) -> dict[str, int] | None:
     if not isinstance(usage, dict):
         return None
@@ -56,12 +68,22 @@ def _usage_details(usage: Any) -> dict[str, int] | None:
         ("total", ("total_tokens",)),
     )
     details = {}
+    input_source = None
     for target, names in sources:
         for name in names:
             value = usage.get(name)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 details[target] = value
+                if target == "input":
+                    input_source = name
                 break
+    # A cached prompt token is billed at a lower price, so keep it out of the
+    # uncached input count Langfuse uses with the "input" price.
+    if input_source == "prompt_tokens":
+        cached = _cached_input_tokens(usage, details["input"])
+        if cached:
+            details["input"] -= cached
+            details["input_cached_tokens"] = cached
     return details or None
 
 

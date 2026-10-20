@@ -45,11 +45,13 @@ def action(tool: str, **args) -> str:
     return json.dumps({"action": tool, "args": args})
 
 
-def model_reply(content: str) -> dict:
+def model_reply(content: str, usage: dict | None = None) -> dict:
     return {
         "model": MODEL_ID,
         "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+        "usage": usage if usage is not None else {
+            "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14
+        },
     }
 
 
@@ -316,6 +318,45 @@ class SuccessfulTraceTests(TracingSessionTestCase):
 
         self.assertEqual(self.langfuse.flush_calls, 2)
 
+    def test_cached_prompt_tokens_are_split_in_the_generation_only(self):
+        usage = {
+            "prompt_tokens": 767,
+            "completion_tokens": 22,
+            "total_tokens": 789,
+            "prompt_tokens_details": {"cached_tokens": 640, "audio_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": 0},
+        }
+        self.actions = [
+            action("submit_sql", sql="SELECT 1;"),
+            action("submit_sql", sql="SELECT 2;"),
+        ]
+        self.grader_payloads = [dict(PHASE1_FOLLOW_UP), dict(PHASE2_PASS)]
+
+        def model_handler(request):
+            self.model_requests.append(json.loads(request.content))
+            return httpx.Response(200, json=model_reply(self.actions.pop(0), usage=usage))
+
+        self.model_handler = model_handler
+        with TestClient(self.app()) as client:
+            response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+
+        state = response.json()["state"]
+        model_events = [
+            event for event in state["adk_events"] if event["type"] == "model_call"
+        ]
+        self.assertEqual(len(model_events), 2)
+        for event in model_events:
+            self.assertEqual(event["usage"], usage)
+
+        generations = self.generations(self.root())
+        self.assertEqual(len(generations), 2)
+        for generation in generations:
+            self.assertEqual(
+                generation.updates[0]["usage_details"],
+                {"input": 127, "input_cached_tokens": 640, "output": 22, "total": 789},
+            )
+
     def test_model_retry_count_reaches_the_generation_metadata(self):
         self.actions = [action("submit_sql", sql="SELECT 1;")]
         self.failing_attempts = 2
@@ -534,6 +575,80 @@ class FlushParityTests(TracingSessionTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertGreaterEqual(wall_seconds, 0.5)
         self.assertLess(response.json()["state"]["session_elapsed_seconds"], 0.5)
+
+
+class UsageDetailsTests(unittest.TestCase):
+    def test_cached_prompt_tokens_are_billed_separately(self):
+        usage = {
+            "prompt_tokens": 767,
+            "completion_tokens": 22,
+            "total_tokens": 789,
+            "prompt_tokens_details": {"cached_tokens": 640},
+        }
+        self.assertEqual(
+            tracing._usage_details(usage),
+            {"input": 127, "input_cached_tokens": 640, "output": 22, "total": 789},
+        )
+
+    def test_all_prompt_tokens_cached_leaves_zero_uncached_input(self):
+        usage = {
+            "prompt_tokens": 11,
+            "completion_tokens": 3,
+            "total_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": 11},
+        }
+        self.assertEqual(
+            tracing._usage_details(usage),
+            {"input": 0, "input_cached_tokens": 11, "output": 3, "total": 14},
+        )
+
+    def test_zero_cached_tokens_keeps_the_existing_details(self):
+        usage = {
+            "prompt_tokens": 11,
+            "completion_tokens": 3,
+            "total_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+        self.assertEqual(
+            tracing._usage_details(usage),
+            {"input": 11, "output": 3, "total": 14},
+        )
+
+    def test_invalid_cached_tokens_keep_the_current_behavior(self):
+        baseline = {"input": 11, "output": 3, "total": 14}
+        prompt_details = (
+            None,
+            {},
+            [],
+            {"cached_tokens": True},
+            {"cached_tokens": 1.5},
+            {"cached_tokens": "3"},
+            {"cached_tokens": -1},
+            {"cached_tokens": 12},
+            {"cached_tokens": None},
+        )
+        for details in prompt_details:
+            with self.subTest(details=details):
+                usage = {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 3,
+                    "total_tokens": 14,
+                }
+                if details is not None:
+                    usage["prompt_tokens_details"] = details
+                self.assertEqual(tracing._usage_details(usage), baseline)
+
+    def test_the_input_tokens_path_is_not_split(self):
+        usage = {
+            "input_tokens": 11,
+            "output_tokens": 3,
+            "total_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": 5},
+        }
+        self.assertEqual(
+            tracing._usage_details(usage),
+            {"input": 11, "output": 3, "total": 14},
+        )
 
 
 class DisabledTracingTests(unittest.TestCase):
