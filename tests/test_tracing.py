@@ -12,6 +12,7 @@ from unittest import mock
 import httpx
 from fastapi.testclient import TestClient
 
+from agent import model as model_module
 from agent import server as server_module
 from agent import tool_loop, tracing
 from agent.environment import Environment
@@ -460,7 +461,12 @@ class FlushParityTests(TracingSessionTestCase):
         self.grader_payloads = [dict(payload) for payload in self.GRADER]
         self.model_status = model_status
         self.grader_status = grader_status
-        with mock.patch.object(tool_loop, "_now", StepClock()):
+        # Both clocks are fixed: the loop records tool/session time from
+        # tool_loop._now and the model reply records time from model.time.
+        with mock.patch.object(tool_loop, "_now", StepClock()), \
+                mock.patch.object(
+                    model_module, "time", SimpleNamespace(monotonic=StepClock())
+                ):
             with TestClient(self.app(tracer=tracer)) as client:
                 return self.run_session(client)
 
