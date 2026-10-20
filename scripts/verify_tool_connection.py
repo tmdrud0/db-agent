@@ -37,13 +37,37 @@ EXECUTE_TIMEOUT_SECONDS = 120.0
 ASK_TIMEOUT_SECONDS = 660.0
 
 
-def revision(path: Path) -> str:
+def git_output(path: Path, *args: str) -> str:
     try:
         return subprocess.check_output(
-            ["git", "-C", str(path), "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
-        ).strip()
+            ["git", "-C", str(path), *args], text=True, stderr=subprocess.DEVNULL
+        )
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return "unknown"
+        return ""
+
+
+def revision(path: Path) -> str:
+    return git_output(path, "rev-parse", "HEAD").strip() or "unknown"
+
+
+def parse_tracked_changes(porcelain: str) -> list[str]:
+    changes = []
+    for line in porcelain.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[1]
+        changes.append(path.strip().strip('"'))
+    return changes
+
+
+def tracked_changes(path: Path) -> list[str]:
+    return parse_tracked_changes(
+        git_output(
+            path, "-c", "core.quotepath=false", "status", "--porcelain", "--untracked-files=no"
+        )
+    )
 
 
 def digest(path: Path) -> str:
@@ -80,12 +104,18 @@ def main() -> int:
     simulator_health = httpx.get(f"{user_sim}/health", timeout=5, trust_env=False).json()
     calls_before = simulator_health.get("model_calls")
     payload = {"task_id": task_id, "task_data": {**task_data, "_interact_mode": "a-interact"}}
+    code_changes = tracked_changes(ROOT)
+    vendor_changes = tracked_changes(VENDOR)
 
     record = {
         "verified_at": datetime.now(timezone(timedelta(hours=9))).isoformat(),
         "mode": "tool-connection-check",
         "code_sha": revision(ROOT),
+        "code_dirty": bool(code_changes),
+        "code_uncommitted_paths": code_changes,
         "vendor_sha": revision(VENDOR),
+        "vendor_dirty": bool(vendor_changes),
+        "vendor_uncommitted_paths": vendor_changes,
         "data_file": args.data.name,
         "data_sha256": digest(args.data),
         "task_index": args.task_index,
