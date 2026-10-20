@@ -6,6 +6,7 @@ __pycache__/
 .env.*
 !.env.example
 .commandcode/
+.claude/
 .vscode/
 vendor/
 private/
