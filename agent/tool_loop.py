@@ -9,6 +9,7 @@ stay under code control.
 """
 
 import asyncio
+import json
 import time
 
 from agent.environment import Environment, ExecuteResult, GradingError
@@ -131,6 +132,14 @@ def _observation(index: int, phase: int, name: str, cost: float, state: dict, bo
         f"[action {index} | phase {phase} | {name} | cost {cost:g} | "
         f"budget {budget(state):g}]\n{body}"
     )
+
+
+def _action_history(name: str, args: dict) -> dict:
+    """The assistant message later calls see: only the action that was executed."""
+    return {
+        "role": "assistant",
+        "content": json.dumps({"action": name, "args": args}, ensure_ascii=False),
+    }
 
 
 def _ignored_notice(parsed: ParsedAction) -> str:
@@ -694,6 +703,9 @@ async def _session_loop(
             })
             continue
         name, args = parsed.name, parsed.args
+        # The executed action replaces the raw response in the dialogue, so invented
+        # observations and extra actions never look like real tool output to the model.
+        messages[-1] = _action_history(name, args)
         event["action"] = {"name": name, "args": args}
         if parsed.action_count > 1:
             event["action_count"] = parsed.action_count

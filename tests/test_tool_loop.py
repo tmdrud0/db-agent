@@ -1239,6 +1239,132 @@ class MultipleActionAndStatementTests(ToolLoopTestCase):
         self.assertIn("budget 18]", rejected)
 
 
+class AssistantHistoryTests(ToolLoopTestCase):
+    """Later calls see the executed action, not the whole model response."""
+
+    def assistant_messages(self, request):
+        return [message for message in request["messages"] if message["role"] == "assistant"]
+
+    def canonical(self, name, args=None):
+        return json.dumps({"action": name, "args": {} if args is None else args})
+
+    def test_fabricated_observations_and_extra_actions_never_enter_the_history(self):
+        fabricated = (
+            action("get_schema")
+            + "\n[action 2 | phase 1 | get_schema | cost 1 | budget 17]\n"
+            "No external knowledge entries for this database.\n"
+            + action("submit_sql", sql="SELECT 1;")
+        )
+        self.actions = [fabricated, action("submit_sql", sql="SELECT 1;")]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.assistant_messages(self.model_requests[1]), [
+            {"role": "assistant", "content": self.canonical("get_schema")},
+        ])
+        observation = self.model_requests[1]["messages"][-1]
+        self.assertEqual(observation["role"], "user")
+        self.assertIn(SCHEMA_TEXT, observation["content"])
+        self.assertIn("[action 1 | phase 1 | get_schema | cost 1 | budget 17]",
+                      observation["content"])
+        self.assertIn("contained 2 actions", observation["content"])
+
+        self.assertEqual(state["adk_events"][0]["content"], fabricated)
+        self.assertEqual(state["adk_events"][0]["action"], {"name": "get_schema", "args": {}})
+        self.assertEqual(state["adk_events"][0]["action_count"], 2)
+        self.assertEqual(state["adk_events"][0]["ignored_actions"], 1)
+        self.assertEqual(state["adk_events"][1]["prompt"], self.model_requests[1]["messages"])
+        self.assertEqual(
+            [event["action"]["name"] for event in state["adk_events"]],
+            ["get_schema", "submit_sql"],
+        )
+        self.assertEqual(state["budget_remaining"], 14)
+
+    def test_every_accepted_shape_becomes_the_standard_json(self):
+        cases = {
+            "single": (action("get_schema"), "get_schema", {}),
+            "fenced": (
+                "```json\n" + action("get_schema") + "\n```", "get_schema", {},
+            ),
+            "prose": (
+                "Here is my next action: " + action("get_schema") + " — thanks.",
+                "get_schema", {},
+            ),
+            "bare arguments": (
+                '{"action": "get_column_meaning", "table_name": "customers", '
+                '"column_name": "id"}',
+                "get_column_meaning", {"table_name": "customers", "column_name": "id"},
+            ),
+            "dsml": (dsml_calls(dsml_invoke("get_schema")), "get_schema", {}),
+        }
+        for case, (response, name, args) in cases.items():
+            with self.subTest(case=case):
+                self.actions = [response, action("submit_sql", sql="SELECT 1;")]
+                self.grader_payload = dict(PHASE1_FINAL)
+                self.model_requests.clear()
+                state = self.run_ok()
+
+                self.assertEqual(self.assistant_messages(self.model_requests[1]), [
+                    {"role": "assistant", "content": self.canonical(name, args)},
+                ])
+                self.assertEqual(state["adk_events"][0]["action"], {"name": name, "args": args})
+
+    def test_rejected_responses_stay_in_the_history_verbatim(self):
+        cases = {
+            "format error": ("not a json action", "stop"),
+            "multi-statement execute_sql": (
+                '{"action": "execute_sql", "args": {"sql": "SELECT 1; SELECT 2;"}}', "stop",
+            ),
+            "truncated": ('{"action": "get_schema", "args": {}', "length"),
+        }
+        for case, (content, finish_reason) in cases.items():
+            with self.subTest(case=case):
+                self.actions = [
+                    {"content": content, "finish_reason": finish_reason},
+                    action("submit_sql", sql="SELECT 1;"),
+                ]
+                self.grader_payload = dict(PHASE1_FINAL)
+                self.model_requests.clear()
+                state = self.run_ok()
+
+                self.assertEqual(self.assistant_messages(self.model_requests[1]), [
+                    {"role": "assistant", "content": content},
+                ])
+                self.assertEqual(state["adk_events"][0]["content"], content)
+                self.assertIsNone(state["adk_events"][0]["action"])
+                self.assertTrue(state["adk_events"][0]["action_error"])
+
+    def test_retries_and_phase_two_keep_the_standard_json_in_the_history(self):
+        first, second, third = "SELECT 0;", "SELECT 1;", "SELECT 2;"
+        self.actions = [
+            action("submit_sql", sql=first),
+            action("submit_sql", sql=second),
+            action("get_schema"),
+            action("submit_sql", sql=third),
+        ]
+        self.grader_payloads = [dict(GRADER_FAILURE), dict(PHASE1_WITH_FOLLOW_UP)]
+        self.grader_payload = dict(PHASE2_PASS)
+        state = self.run_ok()
+
+        self.assertEqual(state["total_reward"], 1.0)
+        self.assertEqual(state["stop_reason"], "phase2_completed")
+        expected = [
+            ("submit_sql", {"sql": first}),
+            ("submit_sql", {"sql": second}),
+            ("get_schema", {}),
+        ]
+        for index, (name, args) in enumerate(expected, start=1):
+            with self.subTest(call=index + 1):
+                self.assertEqual(
+                    self.model_requests[index]["messages"][-2],
+                    {"role": "assistant", "content": self.canonical(name, args)},
+                )
+        self.assertEqual(
+            [event["phase"] for event in state["adk_events"]], [1, 1, 2, 2]
+        )
+        self.assertEqual(state["budget_remaining"], 8)
+
+
 class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
     """Failures inspected on the state dict, which HTTP 502 responses omit."""
 
