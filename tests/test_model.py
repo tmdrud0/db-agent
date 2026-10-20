@@ -7,7 +7,14 @@ from unittest import mock
 
 import httpx
 
-from agent.model import API_URL, MAX_OUTPUT_TOKENS, MODEL_ID, ModelClient, ModelError
+from agent.model import (
+    API_URL,
+    MAX_OUTPUT_TOKENS,
+    MAX_RETRIES,
+    MODEL_ID,
+    ModelClient,
+    ModelError,
+)
 
 
 def provider_reply(content: str = "SELECT 1;", finish_reason: str = "stop") -> dict:
@@ -60,43 +67,91 @@ class ChatRequestTests(unittest.IsolatedAsyncioTestCase):
                 await self.client(handler).chat([{"role": "user", "content": "q"}])
         self.assertIn("CMD_API_KEY", str(caught.exception))
 
-    async def test_model_http_errors_and_timeouts_are_explicit(self):
+    async def test_http_errors_and_timeouts_use_the_retry_budget(self):
+        requests = []
+
         def failing(request):
+            requests.append(request)
             return httpx.Response(500, json={"error": {"message": "upstream failure"}})
 
         with self.assertRaises(ModelError) as caught:
-            await self.client(failing, api_key="fake-key").chat([{"role": "user", "content": "q"}])
+            await self.client(failing, api_key="fake-key").chat(
+                [{"role": "user", "content": "q"}]
+            )
+        self.assertEqual(len(requests), MAX_RETRIES + 1)
         self.assertIn("500", str(caught.exception))
+        self.assertIn(f"after {MAX_RETRIES + 1} attempts", str(caught.exception))
+
+        timeouts = []
 
         def timing_out(request):
+            timeouts.append(request)
             raise httpx.ReadTimeout("timed out")
 
         with self.assertRaises(ModelError) as caught:
             await self.client(timing_out, api_key="fake-key").chat(
                 [{"role": "user", "content": "q"}]
             )
+        self.assertEqual(len(timeouts), MAX_RETRIES + 1)
         self.assertIn("timed out", str(caught.exception))
+        self.assertIn(f"after {MAX_RETRIES + 1} attempts", str(caught.exception))
 
-    async def test_malformed_payloads_are_model_errors(self):
+    async def test_a_transient_failure_can_succeed_within_the_retry_budget(self):
+        attempts = []
+
+        def handler(request):
+            attempts.append(request)
+            if len(attempts) < MAX_RETRIES + 1:
+                return httpx.Response(503, json={"error": {"message": "busy"}})
+            return httpx.Response(200, json=provider_reply("SELECT 2;"))
+
+        reply = await self.client(handler, api_key="fake-key").chat(
+            [{"role": "user", "content": "q"}]
+        )
+        self.assertEqual(len(attempts), MAX_RETRIES + 1)
+        self.assertEqual(reply.content, "SELECT 2;")
+
+    async def test_client_errors_are_not_retried(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(401, json={"error": {"message": "unauthorized"}})
+
+        with self.assertRaises(ModelError) as caught:
+            await self.client(handler, api_key="fake-key").chat(
+                [{"role": "user", "content": "q"}]
+            )
+        self.assertEqual(len(requests), 1)
+        self.assertIn("401", str(caught.exception))
+
+    async def test_malformed_payloads_use_the_retry_budget(self):
         cases = {
-            "invalid json": httpx.Response(200, content=b"<html>not json</html>"),
-            "missing choices": httpx.Response(200, json={"model": MODEL_ID}),
-            "empty choices": httpx.Response(200, json={"model": MODEL_ID, "choices": []}),
-            "choices not a list": httpx.Response(200, json={"model": MODEL_ID, "choices": {}}),
-            "choice not an object": httpx.Response(200, json={"model": MODEL_ID, "choices": [7]}),
+            "invalid json": lambda: httpx.Response(200, content=b"<html>not json</html>"),
+            "missing choices": lambda: httpx.Response(200, json={"model": MODEL_ID}),
+            "empty choices": lambda: httpx.Response(200, json={"model": MODEL_ID, "choices": []}),
+            "choices not a list": lambda: httpx.Response(
+                200, json={"model": MODEL_ID, "choices": {}}
+            ),
+            "choice not an object": lambda: httpx.Response(
+                200, json={"model": MODEL_ID, "choices": [7]}
+            ),
         }
 
-        def handler_for(response):
-            def handler(request):
-                return response
+        for name, make_response in cases.items():
+            with self.subTest(name=name):
+                requests = []
 
-            return handler
+                def handler(request, make_response=make_response):
+                    requests.append(request)
+                    return make_response()
 
-        for name, response in cases.items():
-            with self.subTest(name=name), self.assertRaises(ModelError):
-                await self.client(handler_for(response), api_key="fake-key").chat(
-                    [{"role": "user", "content": "q"}]
-                )
+                with self.assertRaises(ModelError) as caught:
+                    await self.client(handler, api_key="fake-key").chat(
+                        [{"role": "user", "content": "q"}]
+                    )
+                self.assertEqual(len(requests), MAX_RETRIES + 1)
+                self.assertIn(f"after {MAX_RETRIES + 1} attempts", str(caught.exception))
 
     async def test_empty_and_truncated_content_are_reported_not_fabricated(self):
         def handler_for(response):
@@ -119,13 +174,17 @@ class ChatRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(truncated.truncated)
 
     async def test_error_messages_never_contain_the_api_key(self):
+        requests = []
+
         def handler(request):
+            requests.append(request)
             raise httpx.ConnectError("connection refused")
 
         with self.assertRaises(ModelError) as caught:
             await self.client(handler, api_key="fake-secret-key").chat(
                 [{"role": "user", "content": "q"}]
             )
+        self.assertEqual(len(requests), MAX_RETRIES + 1)
         self.assertNotIn("fake-secret-key", str(caught.exception))
 
 

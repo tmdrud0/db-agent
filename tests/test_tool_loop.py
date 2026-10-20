@@ -16,7 +16,14 @@ from agent.environment import (
     Environment,
     GradingError,
 )
-from agent.model import API_URL, MAX_OUTPUT_TOKENS, MODEL_ID, ModelClient, ModelError
+from agent.model import (
+    API_URL,
+    MAX_OUTPUT_TOKENS,
+    MAX_RETRIES,
+    MODEL_ID,
+    ModelClient,
+    ModelError,
+)
 from agent.server import AGENT_NAME, create_app
 from agent.tool_loop import MAX_MODEL_ACTIONS, submission_key
 from agent.tools import (
@@ -1048,11 +1055,12 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_failure_is_recorded_and_charges_nothing(self):
         self.actions = [action("get_schema")]
         state = self.state()
-        with self.assertRaises(ModelError):
+        with self.assertRaises(ModelError) as caught:
             await tool_loop.run(state, "Answer.", self.environment(), self.client(model_status=500))
         self.assertEqual(state["failure"]["stage"], "model")
         self.assertEqual(state["budget_remaining"], 18)
-        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual(len(self.model_requests), MAX_RETRIES + 1)
+        self.assertIn(f"after {MAX_RETRIES + 1} attempts", str(caught.exception))
         self.assertEqual(self.service_requests, [])
         self.assertEqual(state["adk_events"], [])
         self.assertNotIn("loop_stopped", state)
@@ -1380,7 +1388,7 @@ class ToolLoopConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(responses[0].json()["response"], responses[1].json()["response"])
         self.assertTrue(responses[0].json()["state"]["task_done"])
 
-    async def test_simultaneous_requests_after_a_model_failure_do_not_retry(self):
+    async def test_simultaneous_requests_after_model_retries_are_exhausted_do_not_replay(self):
         self.model_status = 500
         await self.initialize()
         payload = {"task_id": "test-task", "mode": "a-interact", "message": "Answer."}
@@ -1389,7 +1397,7 @@ class ToolLoopConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.client.post("/run_session", json=payload),
         )
         self.assertEqual([response.status_code for response in responses], [502, 502])
-        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual(len(self.model_requests), MAX_RETRIES + 1)
         self.assertEqual(self.service_paths, [])
 
 
