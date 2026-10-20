@@ -31,6 +31,7 @@ from agent.session import (
     restore_failure,
 )
 from agent.tools import ALLOWED_TOOLS, SUBMIT_COST, ActionError, catalog, parse_action
+from agent.tracing import Generation, SessionTrace, Tracer
 
 MAX_MODEL_ACTIONS = 24
 SESSION_TIME_LIMIT_SECONDS = 1500.0
@@ -286,12 +287,30 @@ def _cached_result(state: dict, name: str, args: dict) -> str | None:
 
 
 async def _model_call(
-    state: dict, model: ModelClient, phase: int, messages: list[dict], deadline: float
-) -> tuple[ChatReply, dict]:
+    state: dict,
+    model: ModelClient,
+    phase: int,
+    messages: list[dict],
+    deadline: float,
+    trace: SessionTrace | None = None,
+) -> tuple[ChatReply, dict, Generation | None]:
+    generation = (
+        trace.model_start(
+            phase=phase, call_index=1 + _model_actions(state), messages=messages
+        )
+        if trace is not None
+        else None
+    )
     try:
         reply = await _bounded(model.chat(messages), _remaining(deadline), "the model response")
     except ModelError as exc:
         state["failure"] = {"stage": "model", "message": str(exc)}
+        if generation is not None:
+            generation.error(str(exc), attempts=getattr(exc, "attempts", None))
+        raise
+    except SessionExpired as exc:
+        if generation is not None:
+            generation.error(str(exc))
         raise
     events = state.setdefault("adk_events", [])
     event = {
@@ -312,47 +331,75 @@ async def _model_call(
         "prompt": [dict(message) for message in messages],
     }
     events.append(event)
-    return reply, event
+    return reply, event, generation
 
 
 async def _information(
-    state: dict, environment: Environment, name: str, args: dict, phase: int, deadline: float
+    state: dict,
+    environment: Environment,
+    name: str,
+    args: dict,
+    phase: int,
+    deadline: float,
+    trace: SessionTrace | None = None,
 ) -> str:
     spec = ALLOWED_TOOLS[name]
     budget_before = budget(state)
     cached = _cached_result(state, name, args)
     if cached is not None:
         # The repeated request is not sent again, but the official price still applies.
+        span = (
+            trace.tool_start(
+                name=name, args=args, phase=phase, cost=spec.cost, budget_before=budget_before
+            )
+            if trace is not None
+            else None
+        )
         state["budget_remaining"] = budget_before - spec.cost
-        record_action(
+        entry = record_action(
             state, name, args, {"cache_hit": True}, spec.cost, budget_before,
             phase=phase, cached=True,
         )
+        if span is not None:
+            span.finish(entry)
         return f"Served from the session cache; the same request was already made.\n{cached}"
     remaining = _remaining(deadline)
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before {name} could start")
+    span = (
+        trace.tool_start(
+            name=name, args=args, phase=phase, cost=spec.cost, budget_before=budget_before
+        )
+        if trace is not None
+        else None
+    )
     state["budget_remaining"] = budget_before - spec.cost
     started = _now()
     try:
         content = await _bounded(spec.run(environment, state["task_id"], args), remaining, name)
     except SessionExpired as exc:
-        record_action(
+        entry = record_action(
             state, name, args, {"error": str(exc)}, spec.cost, budget_before,
             phase=phase, timed_out=True, elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         raise
     except GradingError as exc:
-        record_action(
+        entry = record_action(
             state, name, args, {"error": str(exc)}, spec.cost, budget_before, phase=phase,
             elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         state["failure"] = {"stage": "information", "message": str(exc)}
         raise
-    record_action(
+    entry = record_action(
         state, name, args, content, spec.cost, budget_before, phase=phase,
         elapsed_seconds=round(_now() - started, 3),
     )
+    if span is not None:
+        span.finish(entry)
     return content
 
 
@@ -364,14 +411,25 @@ async def _submit_action(
     messages: list[dict],
     index: int,
     deadline: float,
+    trace: SessionTrace | None = None,
 ) -> tuple[str, str] | None:
     """Submit, or report a blocked duplicate. Returns the stop reason when the task ends."""
     budget_before = budget(state)
     if _is_duplicate_submission(state, sql, phase):
-        record_action(
+        span = (
+            trace.tool_start(
+                name="submit_sql", args={"sql": sql}, phase=phase, cost=0.0,
+                budget_before=budget_before,
+            )
+            if trace is not None
+            else None
+        )
+        entry = record_action(
             state, "submit_sql", {"sql": sql}, {"duplicate_sql": True}, 0.0, budget_before,
             phase=phase, blocked="duplicate_sql",
         )
+        if span is not None:
+            span.finish(entry)
         body = (
             f"The same SQL text was already submitted in phase {phase} and was not sent again. "
             "Revise the SQL before submitting."
@@ -385,6 +443,14 @@ async def _submit_action(
     remaining = _remaining(deadline)
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before the submission could start")
+    span = (
+        trace.tool_start(
+            name="submit_sql", args={"sql": sql}, phase=phase, cost=SUBMIT_COST,
+            budget_before=budget_before,
+        )
+        if trace is not None
+        else None
+    )
     state["budget_remaining"] = budget_before - SUBMIT_COST
     started = _now()
     try:
@@ -394,19 +460,23 @@ async def _submit_action(
     except SessionExpired as exc:
         # The grader may already have received the statement, so this is recorded as an
         # unknown outcome instead of a failure or a pass.
-        record_action(
+        entry = record_action(
             state, "submit_sql", {"sql": sql}, {"error": str(exc)}, SUBMIT_COST, budget_before,
             phase=phase, timed_out=True, elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         raise
     except GradingError as exc:
-        record_action(
+        entry = record_action(
             state, "submit_sql", {"sql": sql}, {"error": str(exc)}, SUBMIT_COST, budget_before,
             phase=phase, elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         state["failure"] = {"stage": "grader", "message": str(exc)}
         raise
-    record_action(
+    entry = record_action(
         state, "submit_sql", {"sql": sql}, result.model_dump(), SUBMIT_COST, budget_before,
         phase=phase, elapsed_seconds=round(_now() - started, 3),
     )
@@ -414,6 +484,8 @@ async def _submit_action(
     state.setdefault("submit_attempts", []).append({"phase": phase, "sql": sql})
 
     if not result.passed:
+        if span is not None:
+            span.finish(entry)
         messages.append({
             "role": "user",
             "content": _observation(index, phase, "submit_sql", SUBMIT_COST, state, result.message),
@@ -426,10 +498,13 @@ async def _submit_action(
         state["phase1_completed"] = True
         if not result.has_follow_up:
             state["task_done"] = True
+            if span is not None:
+                span.finish(entry)
             return "phase1_completed", result.message
         state["follow_up_query"] = result.follow_up_query
         state["current_phase"] = 2
         # The official user simulator switches to the follow-up reference exactly once.
+        transition_started = _now()
         try:
             remaining = _remaining(deadline)
             if remaining <= 0:
@@ -441,11 +516,28 @@ async def _submit_action(
             )
         except SessionExpired as exc:
             state["phase_transition"] = {"completed": False, "message": str(exc)}
+            if span is not None:
+                span.transition(
+                    completed=False, message=str(exc),
+                    elapsed_seconds=round(_now() - transition_started, 3),
+                )
+                span.finish(entry, phase_transition=state["phase_transition"])
             raise
         except GradingError as exc:
             state["failure"] = {"stage": "transition", "message": str(exc)}
+            if span is not None:
+                span.transition(
+                    completed=False, message=str(exc),
+                    elapsed_seconds=round(_now() - transition_started, 3),
+                )
+                span.finish(entry, phase_transition={"completed": False, "message": str(exc)})
             raise
         state["phase_transition"] = {"completed": True}
+        if span is not None:
+            span.transition(
+                completed=True, elapsed_seconds=round(_now() - transition_started, 3)
+            )
+            span.finish(entry, phase_transition=state["phase_transition"])
         body = (
             f"{result.message}\nThe phase 1 SQL is applied to the database.\n"
             f"Follow-up question:\n{result.follow_up_query or ''}"
@@ -458,6 +550,8 @@ async def _submit_action(
 
     state["phase2_completed"] = True
     state["task_done"] = True
+    if span is not None:
+        span.finish(entry)
     return "phase2_completed", result.message
 
 
@@ -474,7 +568,12 @@ def _execute_observation(result: ExecuteResult) -> str:
 
 
 async def _execute_action(
-    state: dict, environment: Environment, sql: str, phase: int, deadline: float
+    state: dict,
+    environment: Environment,
+    sql: str,
+    phase: int,
+    deadline: float,
+    trace: SessionTrace | None = None,
 ) -> str:
     """Run one execute_sql call; an official SQL error is an observation, not a failure."""
     spec = ALLOWED_TOOLS["execute_sql"]
@@ -482,6 +581,14 @@ async def _execute_action(
     remaining = _remaining(deadline)
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before execute_sql could start")
+    span = (
+        trace.tool_start(
+            name=spec.name, args={"sql": sql}, phase=phase, cost=spec.cost,
+            budget_before=budget_before,
+        )
+        if trace is not None
+        else None
+    )
     state["budget_remaining"] = budget_before - spec.cost
     started = _now()
     try:
@@ -489,20 +596,24 @@ async def _execute_action(
             environment.execute_sql(state["task_id"], sql), remaining, "execute_sql"
         )
     except SessionExpired as exc:
-        record_action(
+        entry = record_action(
             state, spec.name, {"sql": sql}, {"kind": "cancelled", "error": str(exc)},
             spec.cost, budget_before, phase=phase, timed_out=True,
             elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         raise
     except GradingError as exc:
-        record_action(
+        entry = record_action(
             state, spec.name, {"sql": sql}, {"kind": "service_error", "error": str(exc)},
             spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         state["failure"] = {"stage": "execute_sql", "message": str(exc)}
         raise
-    record_action(
+    entry = record_action(
         state, spec.name, {"sql": sql},
         {
             "kind": "result" if result.success else "sql_error",
@@ -510,11 +621,18 @@ async def _execute_action(
         },
         spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
     )
+    if span is not None:
+        span.finish(entry)
     return _execute_observation(result)
 
 
 async def _ask_action(
-    state: dict, environment: Environment, question: str, phase: int, deadline: float
+    state: dict,
+    environment: Environment,
+    question: str,
+    phase: int,
+    deadline: float,
+    trace: SessionTrace | None = None,
 ) -> str:
     """Ask the official user simulator; only a valid answer enters the dialogue."""
     spec = ALLOWED_TOOLS["ask_user"]
@@ -522,6 +640,14 @@ async def _ask_action(
     remaining = _remaining(deadline)
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before ask_user could start")
+    span = (
+        trace.tool_start(
+            name=spec.name, args={"question": question}, phase=phase, cost=spec.cost,
+            budget_before=budget_before,
+        )
+        if trace is not None
+        else None
+    )
     state["budget_remaining"] = budget_before - spec.cost
     started = _now()
     try:
@@ -531,33 +657,45 @@ async def _ask_action(
     except SessionExpired as exc:
         # The simulator may still be calling its model; no answer is invented for the
         # interrupted question.
-        record_action(
+        entry = record_action(
             state, spec.name, {"question": question},
             {"kind": "cancelled", "answer": None, "error": str(exc)},
             spec.cost, budget_before, phase=phase, timed_out=True,
             elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         raise
     except GradingError as exc:
-        record_action(
+        entry = record_action(
             state, spec.name, {"question": question},
             {"kind": "service_error", "answer": None, "error": str(exc)},
             spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
         )
+        if span is not None:
+            span.finish(entry)
         state["failure"] = {"stage": "ask_user", "message": str(exc)}
         raise
-    record_action(
+    entry = record_action(
         state, spec.name, {"question": question},
         {"kind": "answer", "answer": answer, "error": None},
         spec.cost, budget_before, phase=phase, elapsed_seconds=round(_now() - started, 3),
     )
+    if span is not None:
+        span.finish(entry)
     history = state.setdefault("dialogue_history", [])
     history.append({"role": "agent", "content": question, "phase": phase})
     history.append({"role": "user", "content": answer, "phase": phase})
     return f"User answer:\n{answer}"
 
 
-async def run(state: dict, message: str, environment: Environment, model: ModelClient) -> str:
+async def run(
+    state: dict,
+    message: str,
+    environment: Environment,
+    model: ModelClient,
+    tracer: Tracer | None = None,
+) -> str:
     # Repeated requests return the cached outcome instead of calling out again.
     if state.get("loop_stopped"):
         return state["final_response"]
@@ -566,6 +704,40 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
         raise restore_failure(state["failure"])
 
     query = resolve_query(state, message)
+    trace = None
+    if tracer is not None:
+        try:
+            trace = tracer.start_session(task_id=str(state.get("task_id") or ""), input=query)
+        except Exception:
+            trace = None
+    try:
+        response = await _session_loop(state, query, environment, model, trace)
+    except ModelError as exc:
+        if trace is not None:
+            trace.fail("model", str(exc))
+        raise
+    except GradingError as exc:
+        failure = state.get("failure")
+        stage = failure.get("stage") if isinstance(failure, dict) else None
+        if trace is not None:
+            trace.fail(str(stage or "grading"), str(exc))
+        raise
+    else:
+        if trace is not None:
+            trace.finish(state)
+        return response
+    finally:
+        if trace is not None:
+            trace.end()
+
+
+async def _session_loop(
+    state: dict,
+    query: str,
+    environment: Environment,
+    model: ModelClient,
+    trace: SessionTrace | None,
+) -> str:
     started = _now()
     deadline = started + SESSION_TIME_LIMIT_SECONDS
     messages = [
@@ -600,12 +772,16 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
             )
 
         try:
-            reply, event = await _model_call(state, model, phase, messages, deadline)
+            reply, event, generation = await _model_call(
+                state, model, phase, messages, deadline, trace
+            )
         except SessionExpired as exc:
             return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
         messages.append({"role": "assistant", "content": reply.content})
         # The response may have arrived right at the limit; nothing is executed after it.
         if _remaining(deadline) <= 0:
+            if generation is not None:
+                generation.finish(reply)
             return stop(
                 "session_time_limit",
                 f"Stopped: {_limit_text()} was reached after the model response, so the action "
@@ -619,30 +795,38 @@ async def run(state: dict, message: str, environment: Environment, model: ModelC
                 reason = "The response hit the output token limit before a complete action. " + reason
             event["action_error"] = reason
             event["action"] = None
+            if generation is not None:
+                generation.finish(reply, action_error=reason)
             messages.append({
                 "role": "user",
                 "content": _observation(index, phase, "rejected", 0.0, state, reason),
             })
             continue
         event["action"] = {"name": name, "args": args}
+        if generation is not None:
+            generation.finish(reply, action={"name": name, "args": args})
 
         try:
             if name == "submit_sql":
                 outcome = await _submit_action(
-                    state, environment, args["sql"], phase, messages, index, deadline
+                    state, environment, args["sql"], phase, messages, index, deadline, trace
                 )
                 if outcome is not None:
                     return stop(*outcome)
                 continue
 
             if name == "execute_sql":
-                content = await _execute_action(state, environment, args["sql"], phase, deadline)
+                content = await _execute_action(
+                    state, environment, args["sql"], phase, deadline, trace
+                )
             elif name == "ask_user":
                 content = await _ask_action(
-                    state, environment, args["question"], phase, deadline
+                    state, environment, args["question"], phase, deadline, trace
                 )
             else:
-                content = await _information(state, environment, name, args, phase, deadline)
+                content = await _information(
+                    state, environment, name, args, phase, deadline, trace
+                )
         except SessionExpired as exc:
             return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
         messages.append({

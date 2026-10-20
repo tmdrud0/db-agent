@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -15,6 +16,12 @@ from agent.model import MODEL_ID, ModelClient, ModelError
 from agent.session import InputError
 from agent.tool_loop import run as run_tool_loop
 from agent.tools import tool_metadata
+from agent.tracing import (
+    FLUSH_TIMEOUT_SECONDS,
+    SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
+    Tracer,
+    create_tracer,
+)
 
 AGENT_NAME = "deepseek-v4.1-flash-tool-selecting-two-phase"
 SUPPORTED_MODE = "tools"
@@ -44,6 +51,7 @@ def create_app(
     environment: Environment | None = None,
     model: ModelClient | None = None,
     mode: str | None = None,
+    tracer: Tracer | None = None,
 ) -> FastAPI:
     # The tool-selecting loop is the only agent. An explicit request for a
     # removed mode must fail instead of silently running a different agent.
@@ -53,10 +61,26 @@ def create_app(
         raise ValueError(
             f"Unknown agent mode '{selected}'; only '{SUPPORTED_MODE}' is supported"
         )
-    app = FastAPI(title=f"BIRD custom agent: {AGENT_NAME}")
     environment = environment or Environment()
     model = model or ModelClient()
+    tracer = tracer if tracer is not None else create_tracer(
+        agent_name=AGENT_NAME, model_id=MODEL_ID
+    )
     sessions: dict[tuple[str, str], Session] = {}
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            # The runner normally stops the server with Stop-Process, so each
+            # session also flushes before its response; this covers clean exits.
+            try:
+                await tracer.flush(SHUTDOWN_FLUSH_TIMEOUT_SECONDS)
+            except Exception:
+                pass
+
+    app = FastAPI(title=f"BIRD custom agent: {AGENT_NAME}", lifespan=lifespan)
 
     @app.get("/health")
     async def health():
@@ -99,7 +123,9 @@ def create_app(
             raise HTTPException(404, "Call /init_session first")
         async with session.lock:
             try:
-                response = await run_tool_loop(session.state, req.message, environment, model)
+                response = await run_tool_loop(
+                    session.state, req.message, environment, model, tracer
+                )
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc
             except ModelError as exc:
@@ -108,11 +134,20 @@ def create_app(
                 raise HTTPException(502, f"Model service error: {exc}") from exc
             except GradingError as exc:
                 raise HTTPException(502, f"Benchmark service error: {exc}") from exc
-            return {
-                "task_id": req.task_id, "mode": req.mode,
-                "session_id": session.session_id,
-                "response": response, "state": deepcopy(session.state),
-            }
+            else:
+                return {
+                    "task_id": req.task_id, "mode": req.mode,
+                    "session_id": session.session_id,
+                    "response": response, "state": deepcopy(session.state),
+                }
+            finally:
+                # The runner force-stops the server, so the trace of this
+                # session is sent before the response can leave. A slow or
+                # failing Langfuse call never changes the response.
+                try:
+                    await tracer.flush(FLUSH_TIMEOUT_SECONDS)
+                except Exception:
+                    pass
 
     return app
 

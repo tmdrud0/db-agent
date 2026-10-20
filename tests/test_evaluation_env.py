@@ -53,6 +53,32 @@ Write-Output "value: $env:AGENT_MODE"
 """
 
 
+LANGFUSE_HARNESS = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:DB_AGENT_TEST_SCRIPT, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw 'PowerShell syntax error' }
+$loader = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Import-LangfuseSettings'
+}, $true)
+if (!$loader) { throw 'Langfuse loader was not found' }
+. ([scriptblock]::Create($loader.Extent.Text))
+Import-LangfuseSettings -PythonExe $env:DB_AGENT_TEST_PYTHON -EnvPath $env:DB_AGENT_TEST_ENV
+if ([string]$env:LANGFUSE_PUBLIC_KEY -cne [string]$env:DB_AGENT_TEST_EXPECTED_PUBLIC) {
+    throw 'Unexpected public key'
+}
+if ([string]$env:LANGFUSE_SECRET_KEY -cne [string]$env:DB_AGENT_TEST_EXPECTED_SECRET) {
+    throw 'Unexpected secret key'
+}
+if ([string]$env:LANGFUSE_BASE_URL -cne [string]$env:DB_AGENT_TEST_EXPECTED_BASE) {
+    throw 'Unexpected base URL'
+}
+Write-Output 'ok'
+"""
+
+
 class AgentModeGuardTests(unittest.TestCase):
     def check_guard(self, mode: str) -> str:
         child_env = os.environ.copy()
@@ -125,6 +151,70 @@ class EvaluationEnvTests(unittest.TestCase):
 
     def test_dotenv_without_key_leaves_the_key_unset(self):
         self.check_loader('DB_AGENT_TEST_OTHER=dotenv\n', None, '')
+
+
+class LangfuseEnvTests(unittest.TestCase):
+    def check_loader(self, content, inherited, expected):
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / '.env'
+            if content is not None:
+                env_path.write_text(content, encoding='utf-8-sig')
+            child_env = os.environ.copy()
+            for name in ('LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY', 'LANGFUSE_BASE_URL'):
+                child_env.pop(name, None)
+            child_env.update(inherited)
+            child_env.update({
+                'DB_AGENT_TEST_SCRIPT': str(ROOT / 'scripts/run-evaluation.ps1'),
+                'DB_AGENT_TEST_PYTHON': sys.executable,
+                'DB_AGENT_TEST_ENV': str(env_path),
+                'DB_AGENT_TEST_EXPECTED_PUBLIC': expected[0],
+                'DB_AGENT_TEST_EXPECTED_SECRET': expected[1],
+                'DB_AGENT_TEST_EXPECTED_BASE': expected[2],
+                'PYTHONUTF8': '1',
+            })
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive', '-Command', LANGFUSE_HARNESS],
+                cwd=directory, env=child_env, capture_output=True, text=True, timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'ok')
+        self.assertNotIn('fake-', result.stdout + result.stderr)
+
+    def test_dotenv_values_are_loaded_without_output(self):
+        self.check_loader(
+            'LANGFUSE_PUBLIC_KEY="fake-public"\n'
+            'LANGFUSE_SECRET_KEY="fake-secret"\n'
+            'LANGFUSE_BASE_URL="https://fake.example.test"\n',
+            {},
+            ('fake-public', 'fake-secret', 'https://fake.example.test'),
+        )
+
+    def test_existing_environment_values_take_priority(self):
+        self.check_loader(
+            'LANGFUSE_PUBLIC_KEY=fake-dotenv-public\n'
+            'LANGFUSE_SECRET_KEY=fake-dotenv-secret\n'
+            'LANGFUSE_BASE_URL=https://fake-dotenv.example.test\n',
+            {
+                'LANGFUSE_PUBLIC_KEY': 'fake-inherited-public',
+                'LANGFUSE_SECRET_KEY': 'fake-inherited-secret',
+                'LANGFUSE_BASE_URL': 'https://fake-inherited.example.test',
+            },
+            (
+                'fake-inherited-public',
+                'fake-inherited-secret',
+                'https://fake-inherited.example.test',
+            ),
+        )
+
+    def test_missing_dotenv_leaves_the_settings_unset(self):
+        self.check_loader(None, {}, ('', '', ''))
+
+    def test_partial_dotenv_only_sets_present_values(self):
+        self.check_loader(
+            'LANGFUSE_PUBLIC_KEY=fake-public\n',
+            {},
+            ('fake-public', '', ''),
+        )
 
 
 if __name__ == '__main__':

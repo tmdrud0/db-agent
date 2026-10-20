@@ -19,6 +19,10 @@ MAX_RETRIES = 3
 class ModelError(RuntimeError):
     """The model call did not return a usable response."""
 
+    def __init__(self, message: str, attempts: int | None = None):
+        super().__init__(message)
+        self.attempts = attempts
+
 
 class _RetryableModelError(ModelError):
     """A model call failure that may succeed on another attempt."""
@@ -31,6 +35,7 @@ class ChatReply:
     usage: dict | None
     elapsed_seconds: float
     truncated: bool
+    attempts: int = 1
 
 
 class ModelClient:
@@ -63,10 +68,17 @@ class ModelClient:
         # whole sequence.
         for attempt in range(attempts):
             try:
-                return await self._request(payload, headers, started)
+                reply = await self._request(payload, headers, started)
+                reply.attempts = attempt + 1
+                return reply
             except _RetryableModelError as exc:
                 if attempt + 1 == attempts:
-                    raise ModelError(f"{exc} (after {attempts} attempts)") from exc
+                    raise ModelError(
+                        f"{exc} (after {attempts} attempts)", attempts=attempts
+                    ) from exc
+            except ModelError as exc:
+                exc.attempts = attempt + 1
+                raise
         raise AssertionError("unreachable")
 
     async def _request(self, payload: dict, headers: dict, started: float) -> ChatReply:

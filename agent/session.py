@@ -33,7 +33,7 @@ def finish(state: dict, stop_reason: str, response: str) -> str:
 
 def record_action(
     state: dict, tool: str, args: dict, result, cost: float, budget_before: float, **extra
-) -> None:
+) -> dict:
     entry = {
         "type": "tool",
         "tool": tool,
@@ -45,6 +45,7 @@ def record_action(
     }
     entry.update(extra)
     state.setdefault("tool_trajectory", []).append(entry)
+    return entry
 
 
 def restore_failure(failure: dict) -> Exception:

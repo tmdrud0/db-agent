@@ -57,6 +57,42 @@ function Import-AgentApiKey([string]$PythonExe, [string]$EnvPath) {
     if ($loadedKey) { $env:CMD_API_KEY = $loadedKey }
 }
 
+function Import-LangfuseSettings([string]$PythonExe, [string]$EnvPath) {
+    if (!(Test-Path -LiteralPath $EnvPath)) { return }
+
+    # Values already present in the environment win. The keys are captured
+    # without being written to the console, the results or the trace.
+    $json = & $PythonExe -c "import json, sys; from dotenv import dotenv_values; v = dotenv_values(sys.argv[1], encoding='utf-8-sig'); sys.stdout.write(json.dumps({k: v.get(k) or '' for k in ('LANGFUSE_PUBLIC_KEY', 'LANGFUSE_SECRET_KEY', 'LANGFUSE_BASE_URL')}))" $EnvPath
+    if ($LASTEXITCODE -ne 0) { throw 'Could not read Langfuse settings from the project .env file.' }
+    $settings = $json | ConvertFrom-Json
+    if (!$env:LANGFUSE_PUBLIC_KEY -and $settings.LANGFUSE_PUBLIC_KEY) {
+        $env:LANGFUSE_PUBLIC_KEY = $settings.LANGFUSE_PUBLIC_KEY
+    }
+    if (!$env:LANGFUSE_SECRET_KEY -and $settings.LANGFUSE_SECRET_KEY) {
+        $env:LANGFUSE_SECRET_KEY = $settings.LANGFUSE_SECRET_KEY
+    }
+    if (!$env:LANGFUSE_BASE_URL -and $settings.LANGFUSE_BASE_URL) {
+        $env:LANGFUSE_BASE_URL = $settings.LANGFUSE_BASE_URL
+    }
+}
+
+# One evaluation run is one Langfuse session. The runner supplies both the
+# grouping identifier and the code version so traces can be compared by SHA.
+function Set-TraceMetadata([string]$ProjectRoot, [string]$ResultName) {
+    $sha = ''
+    $shaOutput = & git -C $ProjectRoot rev-parse HEAD 2>$null
+    if ($LASTEXITCODE -eq 0) { $sha = ([string]$shaOutput).Trim() }
+    $dirty = $false
+    $changes = & git -C $ProjectRoot status --porcelain --untracked-files=no 2>$null
+    if ($LASTEXITCODE -eq 0 -and ($changes | Where-Object { $_ })) { $dirty = $true }
+    if ($sha) {
+        if ($dirty) { $env:AGENT_CODE_VERSION = "$sha-dirty" }
+        else { $env:AGENT_CODE_VERSION = $sha }
+    }
+    $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+    $env:AGENT_TRACE_SESSION_ID = "$ResultName-$stamp"
+}
+
 # PowerShell 5.1 promotes a native command's stderr to a terminating error while
 # $ErrorActionPreference is Stop, which breaks non-interactive runs (CI, task
 # schedulers). External tools run with the preference relaxed; the exit code is
@@ -144,6 +180,14 @@ Assert-AgentModeEnvironment
 # environment, so the key is loaded before the stack starts. The agent process
 # started below uses the same value.
 Import-AgentApiKey -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
+# Langfuse keys and the run-level trace metadata only reach the host processes;
+# tracing turns into a no-op when either key is missing.
+Import-LangfuseSettings -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
+Set-TraceMetadata -ProjectRoot $projectRoot -ResultName $ResultName
+if ($env:LANGFUSE_PUBLIC_KEY -and $env:LANGFUSE_SECRET_KEY) {
+    # The run identifier is not a credential and lets the trace be found later.
+    Write-Output "Langfuse trace session: $($env:AGENT_TRACE_SESSION_ID)"
+}
 
 Push-Location $projectRoot
 try {
