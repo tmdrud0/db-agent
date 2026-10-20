@@ -47,6 +47,14 @@ class WorktreeMetadataTests(unittest.TestCase):
         self.assertEqual(changes, ["scripts/verify_tool_connection.py"])
         self.assertTrue(changes)
 
+    def test_health_counter_deltas_are_recorded_or_left_unknown(self):
+        before = {"model_calls": 3, "prompt_tokens": 100, "completion_tokens": 20}
+        after = {"model_calls": 5, "prompt_tokens": 180, "completion_tokens": 45}
+        self.assertEqual(self.module.counter_delta(after, before, "model_calls"), 2)
+        self.assertEqual(self.module.counter_delta(after, before, "prompt_tokens"), 80)
+        self.assertIsNone(self.module.counter_delta(after, {}, "model_calls"))
+        self.assertIsNone(self.module.counter_delta({"model_calls": "5"}, before, "model_calls"))
+
     def test_missing_git_is_unknown_and_not_reported_as_dirty(self):
         with mock.patch.object(
             self.module.subprocess, "check_output", side_effect=FileNotFoundError

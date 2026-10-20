@@ -74,6 +74,11 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def counter_delta(after: dict, before: dict, key: str) -> int | None:
+    new, old = after.get(key), before.get(key)
+    return new - old if isinstance(new, int) and isinstance(old, int) else None
+
+
 def post(url: str, payload: dict, timeout: float) -> dict:
     started = time.monotonic()
     response = httpx.post(url, json=payload, timeout=timeout, trust_env=False)
@@ -139,10 +144,12 @@ def main() -> int:
         f"{user_sim}/ask", {"task_id": task_id, "question": QUESTION}, ASK_TIMEOUT_SECONDS
     )
     after = httpx.get(f"{user_sim}/health", timeout=5, trust_env=False).json()
-    record["simulator_calls_during_check"] = (
-        None if not isinstance(after.get("model_calls"), int) or not isinstance(calls_before, int)
-        else after["model_calls"] - calls_before
-    )
+    record["simulator_after"] = after
+    record["simulator_calls_during_check"] = counter_delta(after, simulator_health, "model_calls")
+    record["simulator_tokens_during_check"] = {
+        key: counter_delta(after, simulator_health, key)
+        for key in ("prompt_tokens", "completion_tokens")
+    }
     record["cleanup"] = post(f"{db_env}/cleanup_task", {"task_id": task_id}, INIT_TIMEOUT_SECONDS)
 
     execute_body = record["execute_sql"]["body"]
