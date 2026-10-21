@@ -207,6 +207,83 @@ class ValidationTests(HarnessTestCase):
         self.assert_error(self.root / "invalid", "UTF-8")
 
 
+def _directory_link(link: Path, target: Path) -> None:
+    """Create a directory link without extra privileges where the OS allows it."""
+    if os.name == "nt":
+        import _winapi
+
+        # A junction needs no administrator rights or developer mode on Windows.
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+class LinkTests(HarnessTestCase):
+    def setUp(self):
+        super().setUp()
+        self.write("system.md", "role")
+        self.outside = self.root / "outside"
+        self.outside.mkdir()
+        self.write("ask_user.md", "OUTSIDE-CONTENT", base=self.outside)
+        self.write("secret.md", "OUTSIDE-CONTENT", base=self.outside)
+
+    def assert_link_rejected(self, relative: str):
+        with self.assertRaises(HarnessError) as caught:
+            self.load()
+        self.assertIn(relative, str(caught.exception))
+        self.assertIn("link", str(caught.exception))
+
+    def file_link(self, relative: str):
+        link = self.path / relative
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(self.outside / "secret.md", link)
+        except OSError as exc:
+            self.skipTest(f"file symbolic links are not available here: {exc}")
+
+    def test_a_tools_directory_link_is_rejected(self):
+        _directory_link(self.path / "tools", self.outside)
+        self.assert_link_rejected("tools")
+
+    def test_a_link_inside_tools_is_rejected(self):
+        (self.path / "tools").mkdir()
+        _directory_link(self.path / "tools" / "execute_sql.md", self.outside)
+        self.assert_link_rejected("tools/execute_sql.md")
+
+    def test_file_links_are_rejected(self):
+        for relative in ("tools/ask_user.md", "memory.md"):
+            with self.subTest(relative=relative):
+                self.file_link(relative)
+                self.assert_link_rejected(relative)
+                (self.path / relative).unlink()
+
+    def test_a_linked_system_file_is_rejected(self):
+        (self.path / "system.md").unlink()
+        self.file_link("system.md")
+        self.assert_link_rejected("system.md")
+
+    def test_a_file_reported_as_a_link_is_rejected_without_link_privileges(self):
+        # Creating file symlinks needs extra rights on Windows, so the file-link
+        # branch is also checked by reporting one regular file as a link.
+        self.write("memory.md", "notes")
+        target = self.path / "memory.md"
+        original = Path.is_symlink
+
+        def is_symlink(path):
+            return path == target or original(path)
+
+        with mock.patch.object(Path, "is_symlink", is_symlink):
+            self.assert_link_rejected("memory.md")
+
+    def test_the_harness_root_itself_may_be_a_link(self):
+        self.write("tools/ask_user.md", "local note")
+        alias = self.root / "alias"
+        _directory_link(alias, self.path)
+        harness = load_harness(alias)
+        self.assertEqual(harness.tool_notes, {"ask_user": "local note"})
+        self.assertEqual(harness.sha256, load_harness(self.path).sha256)
+
+
 class HashTests(HarnessTestCase):
     def test_the_same_content_has_the_same_hash(self):
         self.write("system.md", "System.")

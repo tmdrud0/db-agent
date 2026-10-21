@@ -7,7 +7,8 @@ A harness is a directory with one required file and two optional ones:
 - ``tools/<tool name>.md``: usage guidance for one official tool (optional)
 
 Everything else in the directory is rejected so a typo cannot silently drop a
-file. The contract text (response format, tools, prices, limits, rewards and
+file, and so are symbolic links and junctions, so only files that live in the
+harness directory reach the model. The contract text (response format, tools, prices, limits, rewards and
 phase rules) is built by code; harness files only add model input.
 """
 
@@ -68,27 +69,46 @@ def _read_text(path: Path, relative: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _check_inside(entry: Path, real_root: Path, relative: str) -> None:
+    """Reject links so a harness file can never pull in content from elsewhere.
+
+    ``is_file()`` and ``is_dir()`` follow symbolic links and Windows junctions,
+    so without this check a link inside the harness could feed any file on the
+    machine into the model prompt. The resolved path must also stay under the
+    harness root. The root itself may be a link: it is the directory chosen.
+    """
+    if entry.is_symlink() or entry.is_junction():
+        raise HarnessError(f"Harness entry {relative} is a link; harness files must be regular files")
+    if not entry.resolve().is_relative_to(real_root):
+        raise HarnessError(f"Harness entry {relative} resolves outside the harness directory")
+
+
 def _files(root: Path) -> dict[str, Path]:
     if not root.is_dir():
         raise HarnessError(f"Harness directory not found: {root}")
+    real_root = root.resolve()
     system = root / SYSTEM_FILE
     if not system.is_file():
         raise HarnessError(f"Harness directory {root} is missing {SYSTEM_FILE}")
+    _check_inside(system, real_root, SYSTEM_FILE)
     files = {SYSTEM_FILE: system}
     for entry in sorted(root.iterdir(), key=lambda item: item.name):
         if entry.name in (SYSTEM_FILE, TOOLS_DIR):
             continue
         if entry.name == MEMORY_FILE:
+            _check_inside(entry, real_root, MEMORY_FILE)
             if not entry.is_file():
                 raise HarnessError(f"Harness entry {MEMORY_FILE} is not a file")
             files[MEMORY_FILE] = entry
             continue
         raise HarnessError(f"Unrecognized harness entry: {entry.name}")
     tools = root / TOOLS_DIR
-    if tools.exists():
+    if tools.exists() or tools.is_symlink() or tools.is_junction():
+        _check_inside(tools, real_root, TOOLS_DIR)
         if not tools.is_dir():
             raise HarnessError(f"Harness entry {TOOLS_DIR} is not a directory")
         for entry in sorted(tools.iterdir(), key=lambda item: item.name):
+            _check_inside(entry, real_root, f"{TOOLS_DIR}/{entry.name}")
             if not entry.name.endswith(".md") or not entry.is_file():
                 raise HarnessError(f"Unrecognized tool guidance file: {TOOLS_DIR}/{entry.name}")
             tool = entry.name[: -len(".md")]
