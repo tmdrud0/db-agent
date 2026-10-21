@@ -31,12 +31,17 @@ from agent.session import (
     resolve_query,
     restore_failure,
 )
+from agent.subagent import build_user_message
 from agent.tools import (
     ALLOWED_TOOLS,
+    CONSULT_COST,
+    CONSULT_SPEC,
     SUBMIT_COST,
     ActionError,
     ParsedAction,
+    ToolSpec,
     catalog,
+    consult_catalog,
     parse_response,
 )
 from agent.tracing import Generation, SessionTrace, Tracer
@@ -83,16 +88,12 @@ def system_prompt(harness: Harness) -> str:
 
     Order: harness ``system.md``, code contract, harness ``memory.md``. The
     contract (response format, tools, prices, limits, rewards, phase rules) is
-    always the text built here; harness files cannot replace it.
+    always the text built here; harness files cannot replace it. The consult
+    line and its rules appear only when the harness defines a sub-agent, so a
+    harness without one builds the same prompt as before.
     """
-    contract = (
-        "Reply with one JSON object and nothing else:\n"
-        '{"action": "<tool name>", "args": {<tool arguments>}}\n'
-        "\n"
-        "Available actions:\n"
-        f"{catalog(harness.tool_notes)}\n"
-        "\n"
-        "Rules:\n"
+    actions = catalog(harness.tool_notes)
+    rules = (
         "- Only the actions above exist. Any other action name is rejected without cost.\n"
         "- execute_sql explores with one read-only statement. Its result never changes the score\n"
         "  and never replaces submit_sql; an official SQL error is an observation, not a penalty.\n"
@@ -107,6 +108,28 @@ def system_prompt(harness: Harness) -> str:
         f"- The session stops after {MAX_MODEL_ACTIONS} model actions or "
         f"{SESSION_TIME_LIMIT_SECONDS:.0f} seconds, and it stops when fewer than "
         f"{SUBMIT_COST:g} bird-coins remain because a submission would no longer be possible."
+    )
+    if harness.sub_agents:
+        actions += "\n" + consult_catalog(
+            (sub.name, sub.description) for sub in harness.sub_agents.values()
+        )
+        rules += (
+            "\n- consult calls one sub-agent defined by the harness. It is not an official tool\n"
+            "  and costs no bird-coins, but the response that chooses it still counts as one model\n"
+            "  action.\n"
+            "- A sub-agent cannot use the database, the user simulator or the grader. It sees only\n"
+            "  the context listed with its name and the request, and its answer is an observation\n"
+            "  that never changes the score."
+        )
+    contract = (
+        "Reply with one JSON object and nothing else:\n"
+        '{"action": "<tool name>", "args": {<tool arguments>}}\n'
+        "\n"
+        "Available actions:\n"
+        f"{actions}\n"
+        "\n"
+        "Rules:\n"
+        f"{rules}"
     )
     parts = []
     guidance = harness.system.strip("\n")
@@ -165,6 +188,13 @@ def _outcome(state: dict) -> str:
 
 def _model_actions(state: dict) -> int:
     return sum(1 for event in state.get("adk_events", []) if event.get("type") == "model_call")
+
+
+def _allowed_actions(harness: Harness) -> dict[str, ToolSpec]:
+    """The official tools, plus consult only when the harness defines a sub-agent."""
+    if not harness.sub_agents:
+        return ALLOWED_TOOLS
+    return {**ALLOWED_TOOLS, "consult": CONSULT_SPEC}
 
 
 async def _model_call(
@@ -531,6 +561,125 @@ async def _ask_action(
     return f"User answer:\n{answer}"
 
 
+async def _consult_action(
+    state: dict,
+    model: ModelClient,
+    harness: Harness,
+    agent_name: str,
+    request: str,
+    query: str,
+    messages: list[dict],
+    phase: int,
+    deadline: float,
+    trace: SessionTrace | None = None,
+) -> str:
+    """Run one sub-agent call and return its answer as the observation body.
+
+    The call is free and does not touch the official services. A model failure
+    is an observation, not a session failure; only the session deadline stops
+    the loop from here.
+    """
+    sub_agent = harness.sub_agents[agent_name]
+    budget_before = budget(state)
+    remaining = _remaining(deadline)
+    if remaining <= 0:
+        raise SessionExpired(f"{_limit_text()} was reached before consult could start")
+    span = (
+        trace.tool_start(
+            name="consult", args={"agent": agent_name, "request": request}, phase=phase,
+            cost=CONSULT_COST, budget_before=budget_before,
+        )
+        if trace is not None
+        else None
+    )
+    # messages[-1] is the consult action being executed now; the sub-agent sees
+    # the actions and observations that came before it.
+    prompt = [
+        {"role": "system", "content": sub_agent.system},
+        {
+            "role": "user",
+            "content": build_user_message(sub_agent, state, query, messages[2:-1], request),
+        },
+    ]
+    generation = (
+        trace.subagent_start(name=agent_name, messages=prompt) if trace is not None else None
+    )
+    event = {
+        "type": "subagent_call",
+        "harness": state.get("harness"),
+        "agent": agent_name,
+        "prompt": [dict(message) for message in prompt],
+    }
+    started = _now()
+    try:
+        reply = await _bounded(
+            model.chat(prompt), remaining, f"the sub-agent '{agent_name}'"
+        )
+    except SessionExpired as exc:
+        elapsed = round(_now() - started, 3)
+        event.update({
+            "content": "", "truncated": False, "usage": None,
+            "elapsed_seconds": elapsed, "error": str(exc),
+        })
+        state.setdefault("adk_events", []).append(event)
+        if generation is not None:
+            generation.error(str(exc))
+        entry = record_action(
+            state, "consult", {"agent": agent_name, "request": request},
+            {"kind": "cancelled", "content": None, "error": str(exc)},
+            CONSULT_COST, budget_before, phase=phase, timed_out=True,
+            elapsed_seconds=elapsed,
+        )
+        if span is not None:
+            span.finish(entry)
+        raise
+    except ModelError as exc:
+        elapsed = round(_now() - started, 3)
+        event.update({
+            "content": "", "truncated": False, "usage": None,
+            "elapsed_seconds": elapsed, "error": str(exc),
+        })
+        state.setdefault("adk_events", []).append(event)
+        if generation is not None:
+            generation.error(str(exc), attempts=getattr(exc, "attempts", None))
+        entry = record_action(
+            state, "consult", {"agent": agent_name, "request": request},
+            {"kind": "model_error", "content": None, "error": str(exc)},
+            CONSULT_COST, budget_before, phase=phase, elapsed_seconds=elapsed,
+        )
+        if span is not None:
+            span.finish(entry)
+        return (
+            f"The sub-agent '{agent_name}' call failed and no answer is available. "
+            "The failure does not affect the budget or the score.\n"
+            f"Error: {exc}"
+        )
+    elapsed = round(_now() - started, 3)
+    event.update({
+        "content": reply.content,
+        "truncated": reply.truncated,
+        "usage": reply.usage,
+        "elapsed_seconds": reply.elapsed_seconds,
+    })
+    state.setdefault("adk_events", []).append(event)
+    if generation is not None:
+        generation.finish(reply)
+    entry = record_action(
+        state, "consult", {"agent": agent_name, "request": request},
+        {
+            "kind": "answer", "content": reply.content, "error": None,
+            "truncated": reply.truncated,
+        },
+        CONSULT_COST, budget_before, phase=phase, elapsed_seconds=elapsed,
+    )
+    if span is not None:
+        span.finish(entry)
+    body = f"Sub-agent '{agent_name}' answer:\n{reply.content}"
+    if reply.truncated:
+        body += "\n[The sub-agent response was cut off by the output token limit.]"
+    return body
+
+
 def _record_harness(state: dict, harness: Harness) -> None:
     """Keep the harness identity in the session state.
 
@@ -597,6 +746,7 @@ async def _session_loop(
 ) -> str:
     started = _now()
     deadline = started + SESSION_TIME_LIMIT_SECONDS
+    allowed = _allowed_actions(harness)
     messages = [
         {"role": "system", "content": system_prompt(harness)},
         {"role": "user", "content": _initial_prompt(state, query)},
@@ -650,7 +800,13 @@ async def _session_loop(
                     "The response hit the output token limit, so no action was executed. "
                     "Reply with one complete JSON action."
                 )
-            parsed = parse_response(reply.content)
+            parsed = parse_response(reply.content, allowed)
+            if parsed.name == "consult" and parsed.args["agent"] not in harness.sub_agents:
+                available = ", ".join(harness.sub_agents) or "none"
+                raise ActionError(
+                    f"Unknown sub-agent '{parsed.args['agent']}'. "
+                    f"Available sub-agents: {available}."
+                )
         except ActionError as exc:
             reason = str(exc)
             event["action_error"] = reason
@@ -698,15 +854,19 @@ async def _session_loop(
                 content = await _ask_action(
                     state, environment, args["question"], phase, deadline, trace
                 )
+            elif name == "consult":
+                content = await _consult_action(
+                    state, model, harness, args["agent"], args["request"], query,
+                    messages, phase, deadline, trace,
+                )
             else:
                 content = await _information(
                     state, environment, name, args, phase, deadline, trace
                 )
         except SessionExpired as exc:
             return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
+        cost = CONSULT_COST if name == "consult" else ALLOWED_TOOLS[name].cost
         messages.append({
             "role": "user",
-            "content": _observation(
-                index, phase, name, ALLOWED_TOOLS[name].cost, state, content + notice
-            ),
+            "content": _observation(index, phase, name, cost, state, content + notice),
         })

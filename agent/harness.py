@@ -1,10 +1,11 @@
 """Load the harness files that carry the model-facing behavioral guidance.
 
-A harness is a directory with one required file and two optional ones:
+A harness is a directory with one required file and three optional ones:
 
 - ``system.md``: role and solution strategy for the model (required)
 - ``memory.md``: notes shared across tasks (optional)
 - ``tools/<tool name>.md``: usage guidance for one official tool (optional)
+- ``sub_agents/<name>.md``: one sub-agent definition (optional)
 
 Everything else in the directory is rejected so a typo cannot silently drop a
 file, and so are symbolic links and junctions, so only files that live in the
@@ -14,6 +15,7 @@ phase rules) is built by code; harness files only add model input.
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +27,21 @@ DEFAULT_HARNESS_DIR = "harness/baseline"
 SYSTEM_FILE = "system.md"
 MEMORY_FILE = "memory.md"
 TOOLS_DIR = "tools"
+SUB_AGENTS_DIR = "sub_agents"
+SUB_AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+SUB_AGENT_HEADER_KEYS = ("description", "context")
+SUB_AGENT_CONTEXT_ITEMS = ("task", "dialogue", "observations")
+DEFAULT_SUB_AGENT_CONTEXT = ("task", "dialogue")
+
+
+@dataclass(frozen=True)
+class SubAgent:
+    """One sub-agent definition from ``sub_agents/<name>.md``."""
+
+    name: str
+    description: str
+    context: tuple[str, ...]
+    system: str
 
 
 class HarnessError(ValueError):
@@ -41,9 +58,13 @@ class Harness:
     system: str
     memory: str
     tool_notes: dict[str, str]
+    sub_agents: dict[str, SubAgent]
 
     def descriptor(self) -> dict:
         return {"name": self.name, "sha256": self.sha256}
+
+    def sub_agent_names(self) -> list[str]:
+        return list(self.sub_agents)
 
 
 def _resolve(directory: str | os.PathLike | None) -> Path:
@@ -93,7 +114,7 @@ def _files(root: Path) -> dict[str, Path]:
     _check_inside(system, real_root, SYSTEM_FILE)
     files = {SYSTEM_FILE: system}
     for entry in sorted(root.iterdir(), key=lambda item: item.name):
-        if entry.name in (SYSTEM_FILE, TOOLS_DIR):
+        if entry.name in (SYSTEM_FILE, TOOLS_DIR, SUB_AGENTS_DIR):
             continue
         if entry.name == MEMORY_FILE:
             _check_inside(entry, real_root, MEMORY_FILE)
@@ -118,7 +139,81 @@ def _files(root: Path) -> dict[str, Path]:
                     f"official tool. Official tools: {', '.join(ALLOWED_TOOLS)}"
                 )
             files[f"{TOOLS_DIR}/{entry.name}"] = entry
+    files.update(_sub_agent_files(root, real_root))
     return files
+
+
+def _sub_agent_files(root: Path, real_root: Path) -> dict[str, Path]:
+    directory = root / SUB_AGENTS_DIR
+    if not (directory.exists() or directory.is_symlink() or directory.is_junction()):
+        return {}
+    _check_inside(directory, real_root, SUB_AGENTS_DIR)
+    if not directory.is_dir():
+        raise HarnessError(f"Harness entry {SUB_AGENTS_DIR} is not a directory")
+    files = {}
+    for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+        relative = f"{SUB_AGENTS_DIR}/{entry.name}"
+        _check_inside(entry, real_root, relative)
+        if not entry.name.endswith(".md") or not entry.is_file():
+            raise HarnessError(f"Unrecognized sub-agent file: {relative}")
+        name = entry.name[: -len(".md")]
+        if SUB_AGENT_NAME.fullmatch(name) is None:
+            raise HarnessError(
+                f"Sub-agent file {relative} does not match the name rule "
+                f"{SUB_AGENT_NAME.pattern} (lowercase letters, digits and _, starting with a letter)"
+            )
+        files[relative] = entry
+    return files
+
+
+def _parse_sub_agent(name: str, relative: str, text: str) -> SubAgent:
+    """Parse one definition file: a ``---`` header block, then the system prompt."""
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        raise HarnessError(f"Sub-agent file {relative} must start with a '---' header block")
+    end = next((index for index in range(1, len(lines)) if lines[index].strip() == "---"), None)
+    if end is None:
+        raise HarnessError(f"Sub-agent file {relative} has no closing '---' header line")
+    header: dict[str, str] = {}
+    for line in lines[1:end]:
+        if not line.strip():
+            continue
+        key, separator, value = line.partition(":")
+        key = key.strip()
+        if not separator or not key:
+            raise HarnessError(
+                f"Sub-agent header line in {relative} is not 'key: value': {line!r}"
+            )
+        if key not in SUB_AGENT_HEADER_KEYS:
+            raise HarnessError(
+                f"Sub-agent file {relative} has an unsupported header key '{key}'. "
+                f"Supported keys: {', '.join(SUB_AGENT_HEADER_KEYS)}"
+            )
+        if key in header:
+            raise HarnessError(f"Sub-agent file {relative} repeats the header key '{key}'")
+        header[key] = value.strip()
+    description = header.get("description", "")
+    if not description:
+        raise HarnessError(f"Sub-agent file {relative} needs a non-empty description")
+    context = DEFAULT_SUB_AGENT_CONTEXT
+    if "context" in header:
+        items = []
+        for item in header["context"].split(","):
+            value = item.strip()
+            if not value:
+                raise HarnessError(f"Sub-agent file {relative} has an empty context item")
+            if value not in SUB_AGENT_CONTEXT_ITEMS:
+                raise HarnessError(
+                    f"Sub-agent file {relative} has an unsupported context item '{value}'. "
+                    f"Allowed items: {', '.join(SUB_AGENT_CONTEXT_ITEMS)}"
+                )
+            if value not in items:
+                items.append(value)
+        context = tuple(items)
+    body = "\n".join(lines[end + 1:]).strip()
+    if not body:
+        raise HarnessError(f"Sub-agent file {relative} needs a non-empty body")
+    return SubAgent(name=name, description=description, context=context, system=body)
 
 
 def _digest(files: dict[str, str]) -> str:
@@ -142,6 +237,11 @@ def load_harness(directory: str | os.PathLike | None = None) -> Harness:
         for relative in texts
         if relative.startswith(f"{TOOLS_DIR}/")
     }
+    sub_agents = {}
+    for relative in sorted(texts):
+        if relative.startswith(f"{SUB_AGENTS_DIR}/"):
+            name = relative[len(SUB_AGENTS_DIR) + 1: -len(".md")]
+            sub_agents[name] = _parse_sub_agent(name, relative, texts[relative])
     return Harness(
         name=root.name,
         path=root,
@@ -149,4 +249,5 @@ def load_harness(directory: str | os.PathLike | None = None) -> Harness:
         system=texts[SYSTEM_FILE],
         memory=texts.get(MEMORY_FILE, ""),
         tool_notes=tool_notes,
+        sub_agents=sub_agents,
     )

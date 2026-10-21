@@ -8,13 +8,14 @@ loop charges their official prices and records their observations.
 import json
 import re
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Iterable, Mapping
 
 from agent.environment import Environment
 
 SUBMIT_COST = 3.0
 EXECUTE_SQL_COST = 1.0
 ASK_USER_COST = 2.0
+CONSULT_COST = 0.0
 
 SQL_WHITESPACE = " \t\n\r\f\v"
 # Dollar-quote tags follow the unquoted-identifier rules, so non-ASCII
@@ -142,6 +143,16 @@ ASK_USER_SPEC = ToolSpec(
     required=("question",), run=None,
 )
 
+# The local consult action exists only when the harness defines a sub-agent.
+# It is not part of ALLOWED_TOOLS, so /health.tools and the official prices
+# stay exactly the nine official tools.
+CONSULT_SPEC = ToolSpec(
+    name="consult", cost=CONSULT_COST,
+    arguments='{"agent": "<sub-agent name>", "request": "<what the sub-agent should do>"}',
+    summary="ask one harness sub-agent for an answer; the answer is an observation and never changes the score",
+    required=("agent", "request"), run=None,
+)
+
 ALLOWED_TOOLS = {
     **INFORMATION_TOOLS,
     "execute_sql": EXECUTE_SQL_SPEC,
@@ -166,6 +177,17 @@ def catalog(notes: dict[str, str] | None = None) -> str:
         if note:
             lines.append("  Usage note:")
             lines.extend(f"  {line}" for line in note.splitlines())
+    return "\n".join(lines)
+
+
+def consult_catalog(agents: Iterable[tuple[str, str]]) -> str:
+    """The consult line and the available sub-agents, appended inside the catalog."""
+    lines = [
+        f"- {CONSULT_SPEC.name}: {CONSULT_SPEC.summary}. arguments: {CONSULT_SPEC.arguments}. "
+        f"Cost: {CONSULT_SPEC.cost:g}",
+        "  Available sub-agents:",
+    ]
+    lines.extend(f"  - {name}: {description}" for name, description in agents)
     return "\n".join(lines)
 
 
@@ -420,8 +442,15 @@ def _first_dsml_action(content: str, actions: list[_DsmlAction]) -> _DsmlAction:
     return actions[0]
 
 
-def parse_response(content: str) -> ParsedAction:
-    """Turn one model response into its first allowed action and ignored-action count."""
+def parse_response(
+    content: str, allowed: Mapping[str, ToolSpec] | None = None
+) -> ParsedAction:
+    """Turn one model response into its first allowed action and ignored-action count.
+
+    ``allowed`` defaults to the official tools. The loop passes a larger mapping
+    only when the harness defines sub-agents and the local consult action exists.
+    """
+    tools = ALLOWED_TOOLS if allowed is None else allowed
     text = content.strip()
     if not text:
         raise ActionError("The response was empty; reply with one JSON action.")
@@ -437,10 +466,10 @@ def parse_response(content: str) -> ParsedAction:
         name = first["action"].strip()
         if not name:
             raise ActionError('The JSON object needs an "action" member naming one tool.')
-        spec = ALLOWED_TOOLS.get(name)
+        spec = tools.get(name)
         if spec is None:
             raise ActionError(
-                f"Unknown action '{name}'. Available actions: {', '.join(ALLOWED_TOOLS)}."
+                f"Unknown action '{name}'. Available actions: {', '.join(tools)}."
             )
         args = validate_args(spec, _arguments(first))
         first_key = (name, _arguments(first))
@@ -451,10 +480,10 @@ def parse_response(content: str) -> ParsedAction:
         name = first.name
         if not name:
             raise ActionError('The JSON object needs an "action" member naming one tool.')
-        spec = ALLOWED_TOOLS.get(name)
+        spec = tools.get(name)
         if spec is None:
             raise ActionError(
-                f"Unknown action '{name}'. Available actions: {', '.join(ALLOWED_TOOLS)}."
+                f"Unknown action '{name}'. Available actions: {', '.join(tools)}."
             )
         args = validate_args(spec, first.args)
         first_key = (name, first.args)
@@ -469,7 +498,9 @@ def parse_response(content: str) -> ParsedAction:
     return ParsedAction(name, args, action_count=1 + len(others), ignored_actions=ignored)
 
 
-def parse_action(content: str) -> tuple[str, dict]:
+def parse_action(
+    content: str, allowed: Mapping[str, ToolSpec] | None = None
+) -> tuple[str, dict]:
     """Turn one model response into an allowed (tool name, validated arguments)."""
-    parsed = parse_response(content)
+    parsed = parse_response(content, allowed)
     return parsed.name, parsed.args

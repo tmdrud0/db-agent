@@ -127,6 +127,9 @@ class SessionTrace:
     def model_start(self, *, phase: int, call_index: int, messages: list[dict]) -> Generation:
         raise NotImplementedError
 
+    def subagent_start(self, *, name: str, messages: list[dict]) -> Generation:
+        raise NotImplementedError
+
     def tool_start(
         self,
         *,
@@ -178,6 +181,9 @@ class _NoopToolSpan(ToolSpan):
 
 class _NoopSessionTrace(SessionTrace):
     def model_start(self, *, phase, call_index, messages):
+        return _NOOP_GENERATION
+
+    def subagent_start(self, *, name, messages):
         return _NOOP_GENERATION
 
     def tool_start(self, *, name, args, phase, cost, budget_before):
@@ -254,6 +260,42 @@ class _LangfuseGeneration(Generation):
         self._span.end()
 
 
+class _LangfuseSubagentGeneration(Generation):
+    """One sub-agent call, recorded directly under the session trace."""
+
+    def __init__(self, span, *, agent: str, request_model: str):
+        self._span = span
+        self._agent = agent
+        self._request_model = request_model
+
+    def _metadata(self, **extra: Any) -> dict:
+        metadata = {"subagent": self._agent, "request_model": self._request_model}
+        metadata.update({key: value for key, value in extra.items() if value is not None})
+        return metadata
+
+    def finish(self, reply, **_ignored) -> None:
+        self._span.update(
+            output=reply.content,
+            model=reply.response_model or self._request_model,
+            usage_details=_usage_details(reply.usage),
+            metadata=self._metadata(
+                response_model=reply.response_model,
+                elapsed_seconds=reply.elapsed_seconds,
+                truncated=reply.truncated,
+                attempts=getattr(reply, "attempts", 1),
+            ),
+        )
+        self._span.end()
+
+    def error(self, message: str, attempts: int | None = None) -> None:
+        self._span.update(
+            level="ERROR",
+            status_message=message,
+            metadata=self._metadata(attempts=attempts),
+        )
+        self._span.end()
+
+
 class _LangfuseToolSpan(ToolSpan):
     def __init__(
         self,
@@ -278,7 +320,9 @@ class _LangfuseToolSpan(ToolSpan):
         if entry.get("timed_out"):
             message = result.get("error") if isinstance(result, dict) else None
             return "ERROR", message or "The call was cancelled at the session time limit"
-        if isinstance(result, dict) and result.get("kind") in ("service_error", "cancelled"):
+        if isinstance(result, dict) and result.get("kind") in (
+            "service_error", "cancelled", "model_error"
+        ):
             return "ERROR", result.get("error")
         if entry.get("tool") == "submit_sql" and isinstance(result, dict):
             if "passed" not in result:
@@ -408,6 +452,24 @@ class _LangfuseSessionTrace(SessionTrace):
             return _NOOP_GENERATION
         return _LangfuseGeneration(
             span, phase=phase, call_index=call_index, request_model=self._model_id
+        )
+
+    def subagent_start(self, *, name: str, messages: list[dict]) -> Generation:
+        if not self._usable():
+            return _NOOP_GENERATION
+        try:
+            span = self._span.start_observation(
+                name=f"subagent:{name}",
+                as_type="generation",
+                input=[dict(message) for message in messages],
+                model=self._model_id,
+                metadata={"subagent": name, "request_model": self._model_id},
+            )
+        except Exception as exc:
+            self._disable(exc)
+            return _NOOP_GENERATION
+        return _LangfuseSubagentGeneration(
+            span, agent=name, request_model=self._model_id
         )
 
     def tool_start(

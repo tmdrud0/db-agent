@@ -66,6 +66,18 @@ EXPECTED_BASELINE_PROMPT = (
 )
 
 
+def sub_agent_text(
+    description: str = "Reviews SQL.",
+    context: str | None = None,
+    body: str = "Review the SQL.",
+) -> str:
+    lines = ["---", f"description: {description}"]
+    if context is not None:
+        lines.append(f"context: {context}")
+    lines.extend(["---", body, ""])
+    return "\n".join(lines)
+
+
 class HarnessTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -171,6 +183,164 @@ class AssemblyTests(HarnessTestCase):
         ]
         self.assertTrue(prompt.endswith(contract))
 
+    def test_sub_agents_add_the_consult_line_rules_and_agent_list(self):
+        self.write("system.md", "Guidance.")
+        self.write(
+            "sub_agents/reviewer.md",
+            sub_agent_text(description="Reviews candidate SQL.", context="task, dialogue"),
+        )
+        prompt = system_prompt(self.load())
+
+        self.assertIn(
+            "- consult: ask one harness sub-agent for an answer; the answer is an observation "
+            "and never changes the score. arguments: "
+            '{"agent": "<sub-agent name>", "request": "<what the sub-agent should do>"}. Cost: 0',
+            prompt,
+        )
+        self.assertIn(
+            "  Available sub-agents:\n  - reviewer: Reviews candidate SQL.", prompt
+        )
+        self.assertIn("- consult calls one sub-agent defined by the harness.", prompt)
+        self.assertIn("It is not an official tool", prompt)
+        self.assertIn("costs no bird-coins", prompt)
+        self.assertIn("counts as one model\n  action", prompt)
+        self.assertIn("cannot use the database, the user simulator or the grader", prompt)
+        self.assertIn("never changes the score", prompt)
+        # The official catalog lines stay exactly as they are.
+        for line in catalog().splitlines():
+            self.assertIn(line, prompt)
+
+    def test_a_harness_without_sub_agents_has_no_consult_text(self):
+        self.write("system.md", "Guidance.")
+        prompt = system_prompt(self.load())
+
+        self.assertNotIn("consult", prompt)
+        self.assertNotIn("sub-agent", prompt)
+
+
+class SubAgentTests(HarnessTestCase):
+    def test_a_definition_loads_with_its_description_context_and_body(self):
+        self.write("system.md", "Guidance.")
+        self.write("sub_agents/reviewer.md", sub_agent_text(context="task, observations"))
+        harness = self.load()
+
+        self.assertEqual(list(harness.sub_agents), ["reviewer"])
+        sub = harness.sub_agents["reviewer"]
+        self.assertEqual(sub.name, "reviewer")
+        self.assertEqual(sub.description, "Reviews SQL.")
+        self.assertEqual(sub.context, ("task", "observations"))
+        self.assertEqual(sub.system, "Review the SQL.")
+
+    def test_the_default_context_is_task_and_dialogue(self):
+        self.write("system.md", "Guidance.")
+        self.write("sub_agents/reviewer.md", sub_agent_text())
+
+        self.assertEqual(
+            self.load().sub_agents["reviewer"].context, ("task", "dialogue")
+        )
+
+    def test_context_items_keep_their_declared_order_and_drop_duplicates(self):
+        self.write("system.md", "Guidance.")
+        self.write(
+            "sub_agents/reviewer.md",
+            sub_agent_text(context="observations, task, observations"),
+        )
+
+        self.assertEqual(
+            self.load().sub_agents["reviewer"].context, ("observations", "task")
+        )
+
+    def test_names_that_match_the_rule_load(self):
+        self.write("system.md", "Guidance.")
+        for name in ("a", "reviewer2", "a" * 40):
+            self.write(f"sub_agents/{name}.md", sub_agent_text())
+
+        self.assertEqual(list(self.load().sub_agents), ["a", "a" * 40, "reviewer2"])
+
+    def test_names_that_violate_the_rule_fail(self):
+        for index, name in enumerate(
+            ("Reviewer", "_reviewer", "review-er", "1reviewer", "a" * 41)
+        ):
+            with self.subTest(name=name):
+                directory = self.harness(f"invalid-name-{index}", {
+                    "system.md": "x", f"sub_agents/{name}.md": sub_agent_text(),
+                })
+                with self.assertRaises(HarnessError) as caught:
+                    load_harness(directory)
+                self.assertIn("name rule", str(caught.exception))
+
+    def test_invalid_definitions_fail(self):
+        cases = {
+            "missing header": "Review the SQL.\n",
+            "unclosed header": "---\ndescription: Reviews SQL.\nReview the SQL.\n",
+            "missing description": "---\ncontext: task\n---\nReview.\n",
+            "empty description": "---\ndescription:   \n---\nReview.\n",
+            "missing body": "---\ndescription: Reviews SQL.\n---\n\n",
+            "unknown header key": (
+                "---\ndescription: Reviews SQL.\nmodel: fast\n---\nReview.\n"
+            ),
+            "unsupported context item": (
+                "---\ndescription: Reviews SQL.\ncontext: task, files\n---\nReview.\n"
+            ),
+            "empty context item": (
+                "---\ndescription: Reviews SQL.\ncontext: task,\n---\nReview.\n"
+            ),
+            "repeated header key": (
+                "---\ndescription: A\ndescription: B\n---\nReview.\n"
+            ),
+            "malformed header line": "---\ndescription Reviews SQL.\n---\nReview.\n",
+        }
+        for index, (name, text) in enumerate(cases.items()):
+            with self.subTest(case=name):
+                directory = self.harness(f"invalid-{index}", {
+                    "system.md": "x", "sub_agents/reviewer.md": text,
+                })
+                with self.assertRaises(HarnessError):
+                    load_harness(directory)
+
+    def test_unrecognized_sub_agent_entries_fail(self):
+        cases = {
+            "nested directory": {
+                "system.md": "x", "sub_agents/nested/reviewer.md": sub_agent_text(),
+            },
+            "not markdown": {"system.md": "x", "sub_agents/notes.txt": "x"},
+        }
+        for index, (name, files) in enumerate(cases.items()):
+            with self.subTest(case=name):
+                directory = self.harness(f"unrecognized-sub-agent-{index}", files)
+                with self.assertRaises(HarnessError):
+                    load_harness(directory)
+
+        self.write("system.md", "x")
+        (self.path / "sub_agents").write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(HarnessError) as caught:
+            self.load()
+        self.assertIn("sub_agents", str(caught.exception))
+
+
+class ExampleHarnessTests(unittest.TestCase):
+    def test_the_sql_review_example_loads_and_reaches_the_prompt(self):
+        harness = load_harness("harness/sql_review")
+        self.assertEqual(harness.name, "sql_review")
+        self.assertEqual(list(harness.sub_agents), ["sql_reviewer"])
+        sub = harness.sub_agents["sql_reviewer"]
+        self.assertEqual(sub.context, ("task", "dialogue", "observations"))
+        self.assertTrue(sub.description)
+        prompt = system_prompt(harness)
+        self.assertIn("- consult:", prompt)
+        self.assertIn("  - sql_reviewer:", prompt)
+        self.assertIn(sub.description, prompt)
+        self.assertIn("Before you submit, consult the sql_reviewer sub-agent", prompt)
+
+    def test_health_reports_sub_agents_without_changing_the_tool_set(self):
+        client = TestClient(create_app(harness=load_harness("harness/sql_review")))
+        health = client.get("/health").json()
+        self.assertEqual([tool["name"] for tool in health["tools"]], list(TOOL_COSTS))
+        self.assertEqual(health["harness"]["sub_agents"], ["sql_reviewer"])
+
+        baseline = TestClient(create_app(harness=load_harness("harness/baseline")))
+        self.assertEqual(baseline.get("/health").json()["harness"]["sub_agents"], [])
+
 
 class ValidationTests(HarnessTestCase):
     def assert_error(self, path: Path, message: str):
@@ -250,6 +420,15 @@ class LinkTests(HarnessTestCase):
         _directory_link(self.path / "tools" / "execute_sql.md", self.outside)
         self.assert_link_rejected("tools/execute_sql.md")
 
+    def test_a_sub_agents_directory_link_is_rejected(self):
+        _directory_link(self.path / "sub_agents", self.outside)
+        self.assert_link_rejected("sub_agents")
+
+    def test_a_link_inside_sub_agents_is_rejected(self):
+        (self.path / "sub_agents").mkdir()
+        _directory_link(self.path / "sub_agents" / "reviewer.md", self.outside)
+        self.assert_link_rejected("sub_agents/reviewer.md")
+
     def test_file_links_are_rejected(self):
         for relative in ("tools/ask_user.md", "memory.md"):
             with self.subTest(relative=relative):
@@ -310,6 +489,26 @@ class HashTests(HarnessTestCase):
 
         self.assertNotEqual(memory_hash, self.load().sha256)
 
+    def test_changing_a_sub_agent_file_changes_the_hash(self):
+        self.write("system.md", "System.")
+        self.write("sub_agents/reviewer.md", sub_agent_text())
+        before = self.load().sha256
+
+        self.write("sub_agents/reviewer.md", sub_agent_text(body="Review it carefully."))
+
+        self.assertNotEqual(before, self.load().sha256)
+
+    def test_changing_a_sub_agent_name_changes_the_hash(self):
+        self.write("system.md", "System.")
+        self.write("sub_agents/reviewer.md", sub_agent_text())
+        before = self.load().sha256
+
+        (self.path / "sub_agents" / "reviewer.md").rename(
+            self.path / "sub_agents" / "checker.md"
+        )
+
+        self.assertNotEqual(before, self.load().sha256)
+
     def test_line_endings_do_not_change_the_hash(self):
         self.write("system.md", "line one\r\nline two\r\n")
         windows = self.load()
@@ -342,9 +541,9 @@ class DiscoveryTests(HarnessTestCase):
         self.write("system.md", "Second version.")
         health = TestClient(app).get("/health").json()
 
-        self.assertEqual(
-            health["harness"], {"name": self.path.name, "sha256": harness.sha256}
-        )
+        self.assertEqual(health["harness"], {
+            "name": self.path.name, "sha256": harness.sha256, "sub_agents": [],
+        })
         self.assertIn("First version.", system_prompt(harness))
 
 

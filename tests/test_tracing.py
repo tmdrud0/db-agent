@@ -16,6 +16,7 @@ from agent import model as model_module
 from agent import server as server_module
 from agent import tool_loop, tracing
 from agent.environment import Environment
+from agent.harness import load_harness
 from agent.model import MAX_RETRIES, MODEL_ID, ModelClient
 from agent.server import AGENT_NAME, create_app
 from agent.tracing import LangfuseTracer, NoopTracer
@@ -178,6 +179,7 @@ class TracingSessionTestCase(unittest.TestCase):
             ),
             mode="tools",
             tracer=tracer if tracer is not None else self.tracer,
+            harness=getattr(self, "harness", None),
         )
 
     def run_again(self, client) -> httpx.Response:
@@ -411,6 +413,87 @@ class SuccessfulTraceTests(TracingSessionTestCase):
         self.assertEqual(len(self.generations(self.root())), 2)
         self.assertEqual(len(self.model_requests), 2)
         self.assertEqual(self.langfuse.flush_calls, 3)
+
+
+class SubAgentTraceTests(TracingSessionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.harness = load_harness("harness/sql_review")
+
+    def test_a_consult_generation_is_recorded_under_the_session(self):
+        answer = "No problems found."
+        self.actions = [
+            action("consult", agent="sql_reviewer", request="Check SELECT 1;"),
+            answer,
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payloads = [{
+            "passed": True, "reward": 0.7, "message": "Phase 1 correct!",
+            "phase_completed": 1, "has_follow_up": False,
+        }]
+        with TestClient(self.app()) as client:
+            response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+        state = response.json()["state"]
+
+        root = self.root()
+        generations = self.generations(root)
+        self.assertEqual(len(generations), 3)
+        self.assertEqual(
+            [generation.name for generation in generations].count("model_call"), 2
+        )
+        subagent = next(item for item in generations if "sql_reviewer" in item.name)
+        self.assertEqual(subagent.initial["input"], self.model_requests[1]["messages"])
+        self.assertEqual(subagent.initial["model"], MODEL_ID)
+        self.assertEqual(subagent.initial["metadata"]["subagent"], "sql_reviewer")
+        update = subagent.updates[0]
+        self.assertEqual(update["output"], answer)
+        self.assertEqual(
+            update["usage_details"], {"input": 11, "output": 3, "total": 14}
+        )
+        self.assertEqual(update["metadata"]["subagent"], "sql_reviewer")
+        self.assertFalse(update["metadata"]["truncated"])
+        self.assertTrue(subagent.ended)
+        self.assertTrue(all(item.ended for item in self.langfuse.observations))
+
+        self.assertEqual(
+            [item["type"] for item in state["adk_events"]],
+            ["model_call", "subagent_call", "model_call"],
+        )
+        self.assertEqual(state["total_reward"], 0.7)
+
+    def test_a_failed_sub_agent_call_marks_the_generation_as_an_error(self):
+        self.actions = [
+            action("consult", agent="sql_reviewer", request="Check SELECT 1;"),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payloads = [{
+            "passed": True, "reward": 0.7, "message": "Phase 1 correct!",
+            "phase_completed": 1, "has_follow_up": False,
+        }]
+        original = self.model_handler
+
+        def failing_subagent(request):
+            body = json.loads(request.content)
+            system = body["messages"][0]
+            if system["role"] == "system" and "another agent" in system["content"]:
+                self.model_requests.append(body)
+                return httpx.Response(500, json={"error": {"message": "boom"}})
+            return original(request)
+
+        self.model_handler = failing_subagent
+        with TestClient(self.app()) as client:
+            response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+
+        generation = next(
+            item for item in self.generations(self.root()) if "sql_reviewer" in item.name
+        )
+        failure = generation.updates[-1]
+        self.assertEqual(failure["level"], "ERROR")
+        self.assertIn("after", failure["status_message"])
+        self.assertEqual(failure["metadata"]["subagent"], "sql_reviewer")
+        self.assertTrue(generation.ended)
 
 
 class FailureTraceTests(TracingSessionTestCase):

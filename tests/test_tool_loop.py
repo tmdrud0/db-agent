@@ -3,7 +3,9 @@
 import asyncio
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -463,6 +465,7 @@ class ToolLoopTestCase(unittest.TestCase):
             Environment(httpx.MockTransport(self.service_handler)),
             ModelClient(transport=httpx.MockTransport(self.model_handler), api_key="test-key"),
             mode="tools",
+            harness=getattr(self, "harness", None),
         ))
 
     def service_handler(self, request):
@@ -548,7 +551,10 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertEqual(health["mode"], "tools")
         self.assertEqual(health["model"], MODEL_ID)
         self.assertEqual(health["tools"], tool_metadata())
-        self.assertEqual(health["harness"], load_harness().descriptor())
+        self.assertEqual(
+            health["harness"],
+            {**load_harness().descriptor(), "sub_agents": []},
+        )
         self.assertEqual(health["execute_sql_timeout_seconds"], EXECUTE_SQL_TIMEOUT_SECONDS)
         self.assertEqual(health["ask_user_timeout_seconds"], ASK_USER_TIMEOUT_SECONDS)
 
@@ -676,6 +682,29 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertEqual(events[0]["settings"]["endpoint"], API_URL)
         self.assertEqual(events[0]["usage"]["total_tokens"], 14)
         self.assertNotIn("test-key", json.dumps(state))
+
+    def test_consult_is_unknown_in_a_harness_without_sub_agents(self):
+        self.actions = [
+            action("consult", agent="reviewer", request="Check this."),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(len(self.model_requests), 2)
+        self.assertEqual(self.paths(), ["/submit"])
+        self.assertEqual(self.trajectory(state), [("submit_sql", 3.0)])
+        self.assertEqual(state["budget_remaining"], 15)
+        event = model_events(state)[0]
+        self.assertIsNone(event["action"])
+        self.assertIn("Unknown action 'consult'", event["action_error"])
+        feedback = self.model_requests[1]["messages"][-1]["content"]
+        self.assertIn("rejected", feedback)
+        self.assertIn("| cost 0 |", feedback)
+        self.assertNotIn(
+            "subagent_call", [item["type"] for item in state["adk_events"]]
+        )
+        self.assertNotIn("consult", self.model_requests[0]["messages"][0]["content"])
 
     def test_invalid_new_tool_arguments_cost_nothing_and_call_nothing(self):
         self.actions = [
@@ -1082,6 +1111,374 @@ class ExploreAndAskTests(ToolLoopTestCase):
         self.assertIn(USER_ANSWER, feedback)
         self.assertIn("[action 3 | phase 2 | ask_user | cost 2 |", feedback)
         self.assertTrue(state["task_done"])
+
+
+REVIEWER_SYSTEM_PROMPT = "You review SQL. Only report problems."
+
+
+class ConsultTests(ToolLoopTestCase):
+    """The local consult action: harness-defined, free and never an official call."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name) / "consult-harness"
+        (root / "sub_agents").mkdir(parents=True)
+        (root / "system.md").write_text(
+            "Consult the reviewer before submitting.\n", encoding="utf-8"
+        )
+        (root / "sub_agents" / "reviewer.md").write_text(
+            "---\n"
+            "description: Reviews candidate SQL.\n"
+            "context: task, dialogue, observations\n"
+            "---\n"
+            f"{REVIEWER_SYSTEM_PROMPT}\n",
+            encoding="utf-8",
+        )
+        (root / "sub_agents" / "task_only.md").write_text(
+            "---\n"
+            "description: Looks only at the task.\n"
+            "context: task\n"
+            "---\n"
+            "Look only at the task.\n",
+            encoding="utf-8",
+        )
+        (root / "sub_agents" / "dialogue_only.md").write_text(
+            "---\n"
+            "description: Looks only at the dialogue.\n"
+            "context: dialogue\n"
+            "---\n"
+            "Look only at the dialogue.\n",
+            encoding="utf-8",
+        )
+        (root / "sub_agents" / "observations_only.md").write_text(
+            "---\n"
+            "description: Looks only at the observations.\n"
+            "context: observations\n"
+            "---\n"
+            "Look only at the observations.\n",
+            encoding="utf-8",
+        )
+        self.harness = load_harness(root)
+        self.fail_subagent = False
+        super().setUp()
+
+    def model_handler(self, request):
+        body = json.loads(request.content)
+        system = body["messages"][0]
+        if (
+            self.fail_subagent
+            and system["role"] == "system"
+            and system["content"] == REVIEWER_SYSTEM_PROMPT
+        ):
+            self.model_requests.append(body)
+            return httpx.Response(500, json={"error": {"message": "boom"}})
+        return super().model_handler(request)
+
+    def subagent_events(self, state):
+        return [event for event in state["adk_events"] if event["type"] == "subagent_call"]
+
+    def test_consult_sends_the_selected_context_and_returns_an_observation(self):
+        answer = "Problem 1: the query does not filter by region."
+        self.state["internal_note"] = "do-not-send"
+        self.state["hidden_answer"] = "do-not-send-either"
+        self.state["dialogue_history"] = [
+            {"role": "agent", "content": "Which region?", "phase": 1},
+            {"role": "user", "content": "The west region.", "phase": 1},
+        ]
+        execute = action("execute_sql", sql="SELECT 1;")
+        request = "Check SELECT count(*) FROM customers;"
+        self.actions = [
+            execute,
+            action("consult", agent="reviewer", request=request),
+            answer,
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        # One main call per action, plus exactly one sub-agent call.
+        self.assertEqual(len(self.model_requests), 4)
+        subagent_call = self.model_requests[2]
+        self.assertEqual(subagent_call["messages"][0], {
+            "role": "system", "content": REVIEWER_SYSTEM_PROMPT,
+        })
+        context = subagent_call["messages"][1]["content"]
+        self.assertTrue(context.startswith("Task:\n"))
+        self.assertIn("Database: demo", context)
+        self.assertIn("Phase: 1", context)
+        self.assertIn("Phase 1 question:\nHow many customers?", context)
+        self.assertNotIn("Follow-up question:", context)
+        self.assertIn("Dialogue:\nAgent: Which region?\nUser: The west region.", context)
+        self.assertIn(f"Observations:\nAssistant action:\n{execute}", context)
+        self.assertIn(
+            "Observation:\n[action 1 | phase 1 | execute_sql | cost 1 | budget 17]", context
+        )
+        self.assertIn(f"Request:\n{request}", context)
+        self.assertNotIn("submit_sql", context)
+        self.assertNotIn("do-not-send", context)
+
+        # The answer reaches the next main call as the consult observation.
+        feedback = self.model_requests[3]["messages"][-1]["content"]
+        self.assertIn(answer, feedback)
+        self.assertIn("[action 2 | phase 1 | consult | cost 0 | budget 17]", feedback)
+
+        # consult is free, recorded, and never reaches an official service.
+        self.assertEqual(self.paths(), ["/execute", "/submit"])
+        self.assertEqual(
+            self.trajectory(state),
+            [("execute_sql", 1.0), ("consult", 0.0), ("submit_sql", 3.0)],
+        )
+        consult = state["tool_trajectory"][1]
+        self.assertEqual(consult["args"], {"agent": "reviewer", "request": request})
+        self.assertEqual((consult["budget_before"], consult["budget_after"]), (17, 17))
+        self.assertEqual(consult["phase"], 1)
+        self.assertGreaterEqual(consult["elapsed_seconds"], 0)
+        self.assertEqual(consult["result"], {
+            "kind": "answer", "content": answer, "error": None, "truncated": False,
+        })
+        self.assertEqual(state["budget_remaining"], 14)
+
+        events = self.subagent_events(state)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["agent"], "reviewer")
+        self.assertEqual(event["prompt"], subagent_call["messages"])
+        self.assertEqual(event["content"], answer)
+        self.assertFalse(event["truncated"])
+        self.assertEqual(event["usage"], {
+            "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14,
+        })
+        self.assertEqual(event["harness"], state["harness"])
+        self.assertEqual(tool_loop._model_actions(state), 3)
+
+    def test_only_the_configured_context_items_are_sent(self):
+        self.state["dialogue_history"] = [
+            {"role": "agent", "content": "Which region?", "phase": 1},
+            {"role": "user", "content": "The west region.", "phase": 1},
+        ]
+        self.actions = [
+            action("get_schema"),
+            action("consult", agent="task_only", request="Check the question."),
+            "No problems found.",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        context = self.model_requests[2]["messages"][1]["content"]
+        self.assertTrue(context.startswith("Task:\n"))
+        self.assertNotIn("Dialogue:", context)
+        self.assertNotIn("Observations:", context)
+        self.assertNotIn("Which region?", context)
+        self.assertIn("Request:\nCheck the question.", context)
+        self.assertEqual(self.paths(), ["/schema", "/submit"])
+        self.assertEqual(state["budget_remaining"], 14)
+
+    def test_each_context_item_can_be_included_or_left_out(self):
+        self.state["dialogue_history"] = [
+            {"role": "agent", "content": "Which region?", "phase": 1},
+            {"role": "user", "content": "The west region.", "phase": 1},
+        ]
+        self.actions = [
+            action("get_schema"),
+            action("consult", agent="dialogue_only", request="Check the dialogue."),
+            "Dialogue looks consistent.",
+            action("consult", agent="observations_only", request="Check the observations."),
+            "Observations look consistent.",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        dialogue_only = self.model_requests[2]["messages"][1]["content"]
+        self.assertIn(
+            "Dialogue:\nAgent: Which region?\nUser: The west region.", dialogue_only
+        )
+        self.assertNotIn("Task:", dialogue_only)
+        self.assertNotIn("Observations:", dialogue_only)
+        self.assertIn("Request:\nCheck the dialogue.", dialogue_only)
+
+        observations_only = self.model_requests[4]["messages"][1]["content"]
+        self.assertIn(
+            f"Observations:\nAssistant action:\n{action('get_schema')}", observations_only
+        )
+        self.assertIn(
+            "Observation:\n[action 1 | phase 1 | get_schema | cost 1 | budget 17]",
+            observations_only,
+        )
+        # The earlier consult answer is an observation too.
+        self.assertIn("Dialogue looks consistent.", observations_only)
+        self.assertNotIn("Task:", observations_only)
+        self.assertNotIn("Dialogue:", observations_only)
+        self.assertIn("Request:\nCheck the observations.", observations_only)
+        self.assertEqual(self.paths(), ["/schema", "/submit"])
+        self.assertEqual(state["budget_remaining"], 14)
+
+    def test_the_phase_two_follow_up_is_part_of_the_task_context(self):
+        self.state["current_phase"] = 2
+        self.state["follow_up_query"] = "And by region?"
+        self.state["phase1_completed"] = True
+        self.actions = [
+            action("consult", agent="task_only", request="Check the follow-up."),
+            "No problems found.",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE2_PASS)
+        self.run_ok()
+
+        context = self.model_requests[1]["messages"][1]["content"]
+        self.assertIn("Phase: 2", context)
+        self.assertIn("Phase 1 question:\nHow many customers?", context)
+        self.assertIn("Follow-up question:\nAnd by region?", context)
+
+    def test_an_unknown_sub_agent_is_rejected_without_a_model_call(self):
+        self.actions = [
+            action("consult", agent="missing", request="Check this."),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(len(self.model_requests), 2)
+        self.assertEqual(self.paths(), ["/submit"])
+        event = model_events(state)[0]
+        self.assertIsNone(event["action"])
+        self.assertIn("Unknown sub-agent 'missing'", event["action_error"])
+        self.assertIn("reviewer", event["action_error"])
+        feedback = self.model_requests[1]["messages"][-1]["content"]
+        self.assertIn("rejected", feedback)
+        self.assertIn("| cost 0 |", feedback)
+        self.assertEqual(state["budget_remaining"], 15)
+        self.assertEqual(state["tool_trajectory"][0]["tool"], "submit_sql")
+        self.assertEqual(self.subagent_events(state), [])
+
+    def test_invalid_consult_arguments_are_rejected_before_any_call(self):
+        self.actions = [
+            '{"action": "consult", "args": {"agent": "reviewer"}}',
+            '{"action": "consult", "args": {"agent": "reviewer", "request": " "}}',
+            '{"action": "consult", "args": {"agent": "reviewer", "request": "x", "extra": "y"}}',
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(len(self.model_requests), 4)
+        self.assertEqual(self.paths(), ["/submit"])
+        for index in range(3):
+            with self.subTest(index=index):
+                event = model_events(state)[index]
+                self.assertIsNone(event["action"])
+                self.assertTrue(event["action_error"])
+        self.assertEqual(state["budget_remaining"], 15)
+        self.assertEqual(self.subagent_events(state), [])
+
+    def test_a_sub_agent_model_failure_keeps_the_session_alive(self):
+        self.fail_subagent = True
+        self.actions = [
+            action("consult", agent="reviewer", request="Check this."),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        # One consult call, the failed retries, then the next main action.
+        self.assertEqual(len(self.model_requests), MAX_RETRIES + 3)
+        self.assertEqual(self.paths(), ["/submit"])
+        self.assertEqual(
+            self.trajectory(state), [("consult", 0.0), ("submit_sql", 3.0)]
+        )
+        consult = state["tool_trajectory"][0]
+        self.assertEqual(consult["result"]["kind"], "model_error")
+        self.assertIn(f"after {MAX_RETRIES + 1} attempts", consult["result"]["error"])
+        self.assertNotIn("failure", state)
+        self.assertEqual(state["budget_remaining"], 15)
+
+        feedback = self.model_requests[-1]["messages"][-1]["content"]
+        self.assertIn("The sub-agent 'reviewer' call failed", feedback)
+        self.assertIn("does not affect the budget or the score", feedback)
+        self.assertIn("| cost 0 |", feedback)
+        events = state["adk_events"]
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["model_call", "subagent_call", "model_call"],
+        )
+        self.assertEqual(events[1]["content"], "")
+        self.assertIn("error", events[1])
+        self.assertEqual(tool_loop._model_actions(state), 2)
+
+    def test_a_truncated_sub_agent_answer_is_announced(self):
+        self.actions = [
+            action("consult", agent="reviewer", request="Check this."),
+            {"content": "partial review", "finish_reason": "length"},
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        feedback = self.model_requests[2]["messages"][-1]["content"]
+        self.assertIn("partial review", feedback)
+        self.assertIn("cut off by the output token limit", feedback)
+        consult = state["tool_trajectory"][0]
+        self.assertTrue(consult["result"]["truncated"])
+        self.assertEqual(consult["result"]["content"], "partial review")
+        self.assertTrue(self.subagent_events(state)[0]["truncated"])
+
+    def test_consult_counts_one_model_action_and_the_sub_agent_call_none(self):
+        self.actions = []
+        for _ in range(MAX_MODEL_ACTIONS):
+            self.actions.append(
+                action("consult", agent="reviewer", request="Check this.")
+            )
+            self.actions.append("No problems found.")
+        state = self.run_ok()
+
+        self.assertEqual(tool_loop._model_actions(state), MAX_MODEL_ACTIONS)
+        self.assertEqual(len(self.subagent_events(state)), MAX_MODEL_ACTIONS)
+        self.assertEqual(len(self.model_requests), MAX_MODEL_ACTIONS * 2)
+        self.assertEqual(state["stop_reason"], "action_limit_reached")
+        self.assertEqual(state["budget_remaining"], 18)
+
+    def test_the_session_time_limit_ends_a_slow_sub_agent_call(self):
+        self.actions = [action("consult", agent="reviewer", request="Check this.")]
+
+        async def handler(request):
+            body = json.loads(request.content)
+            self.model_requests.append(body)
+            system = body["messages"][0]
+            if system["role"] == "system" and system["content"] == REVIEWER_SYSTEM_PROMPT:
+                await asyncio.sleep(2.0)
+            return httpx.Response(200, json=model_reply(self.actions.pop(0)))
+
+        client = TestClient(create_app(
+            Environment(httpx.MockTransport(self.service_handler)),
+            ModelClient(transport=httpx.MockTransport(handler), api_key="test-key"),
+            mode="tools",
+            harness=self.harness,
+        ))
+        with mock.patch.object(tool_loop, "SESSION_TIME_LIMIT_SECONDS", 1.0):
+            initialized = client.post("/init_session", json={
+                "task_id": "test-task", "mode": "a-interact", "reset": True,
+                "state": dict(self.state),
+            })
+            self.assertEqual(initialized.status_code, 200)
+            response = client.post("/run_session", json={
+                "task_id": "test-task", "mode": "a-interact", "message": "Answer.",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        state = response.json()["state"]
+
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        self.assertIn("session limit", state["final_response"])
+        self.assertEqual(self.service_requests, [])
+        self.assertEqual(state["budget_remaining"], 18)
+        consult = state["tool_trajectory"][0]
+        self.assertEqual(consult["tool"], "consult")
+        self.assertTrue(consult["timed_out"])
+        self.assertEqual(consult["result"]["kind"], "cancelled")
+        self.assertEqual(consult["cost"], 0.0)
+        self.assertNotIn("failure", state)
+        self.assertEqual(self.subagent_events(state)[0]["type"], "subagent_call")
 
 
 class MultipleActionAndStatementTests(ToolLoopTestCase):

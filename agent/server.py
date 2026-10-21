@@ -112,7 +112,11 @@ def create_app(
             # The real tool set identifies the service, so a stale server that
             # only shares the name cannot be reused by the evaluator.
             "tools": tool_metadata(),
-            "harness": harness.descriptor(),
+            # Sub-agents are not official tools: they are reported next to the
+            # harness, so /health.tools keeps exactly the nine official entries.
+            "harness": {
+                **harness.descriptor(), "sub_agents": harness.sub_agent_names()
+            },
             "execute_sql_timeout_seconds": environment.execute_sql_timeout,
             "ask_user_timeout_seconds": environment.ask_user_timeout,
         }
