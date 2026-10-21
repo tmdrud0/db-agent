@@ -111,7 +111,8 @@ def system_prompt(harness: Harness) -> str:
     )
     if harness.sub_agents:
         actions += "\n" + consult_catalog(
-            (sub.name, sub.description) for sub in harness.sub_agents.values()
+            (sub.name, sub.description, sub.fetch)
+            for sub in harness.sub_agents.values()
         )
         rules += (
             "\n- consult calls one sub-agent defined by the harness. It is not an official tool\n"
@@ -121,6 +122,13 @@ def system_prompt(harness: Harness) -> str:
             "  the context listed with its name and the request, and its answer is an observation\n"
             "  that never changes the score."
         )
+        if any(sub.fetch for sub in harness.sub_agents.values()):
+            rules += (
+                "\n- A sub-agent listed with \"Fetches <tool> (cost <n>)\" receives that official\n"
+                "  lookup when it is consulted. The lookup runs once, is charged its official coin\n"
+                "  cost, and its raw output is shown only to the sub-agent; the main agent receives\n"
+                "  only the sub-agent's answer."
+            )
     contract = (
         "Reply with one JSON object and nothing else:\n"
         '{"action": "<tool name>", "args": {<tool arguments>}}\n'
@@ -254,6 +262,7 @@ async def _information(
     phase: int,
     deadline: float,
     trace: SessionTrace | None = None,
+    requested_by: dict | None = None,
 ) -> str:
     spec = ALLOWED_TOOLS[name]
     budget_before = budget(state)
@@ -269,12 +278,15 @@ async def _information(
     )
     state["budget_remaining"] = budget_before - spec.cost
     started = _now()
+    # A lookup a consult requested keeps the official format and adds who asked
+    # for it, so the trajectory shows the sub-agent that caused the charge.
+    extra = {"requested_by": requested_by} if requested_by is not None else {}
     try:
         content = await _bounded(spec.run(environment, state["task_id"], args), remaining, name)
     except SessionExpired as exc:
         entry = record_action(
             state, name, args, {"error": str(exc)}, spec.cost, budget_before,
-            phase=phase, timed_out=True, elapsed_seconds=round(_now() - started, 3),
+            phase=phase, timed_out=True, elapsed_seconds=round(_now() - started, 3), **extra,
         )
         if span is not None:
             span.finish(entry)
@@ -282,7 +294,7 @@ async def _information(
     except GradingError as exc:
         entry = record_action(
             state, name, args, {"error": str(exc)}, spec.cost, budget_before, phase=phase,
-            elapsed_seconds=round(_now() - started, 3),
+            elapsed_seconds=round(_now() - started, 3), **extra,
         )
         if span is not None:
             span.finish(entry)
@@ -290,7 +302,7 @@ async def _information(
         raise
     entry = record_action(
         state, name, args, content, spec.cost, budget_before, phase=phase,
-        elapsed_seconds=round(_now() - started, 3),
+        elapsed_seconds=round(_now() - started, 3), **extra,
     )
     if span is not None:
         span.finish(entry)
@@ -565,6 +577,7 @@ async def _consult_action(
     state: dict,
     model: ModelClient,
     harness: Harness,
+    environment: Environment,
     agent_name: str,
     request: str,
     query: str,
@@ -575,19 +588,41 @@ async def _consult_action(
 ) -> str:
     """Run one sub-agent call and return its answer as the observation body.
 
-    The call is free and does not touch the official services. A model failure
-    is an observation, not a session failure; only the session deadline stops
+    When the definition names a ``fetch`` tool, the official lookup runs first
+    with its official price and a tool span, and the raw output goes only into
+    the sub-agent's user message. A model failure is an observation, not a
+    session failure; the fetch charge stays. Only the session deadline stops
     the loop from here.
     """
     sub_agent = harness.sub_agents[agent_name]
+    fetch = sub_agent.fetch
+    fetch_cost = ALLOWED_TOOLS[fetch].cost if fetch else 0.0
     budget_before = budget(state)
     remaining = _remaining(deadline)
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before consult could start")
+    # Defensive: the loop normally stops below the submission price, which is
+    # above every fetch price, but a consult must never run a lookup it cannot pay.
+    if budget_before < fetch_cost:
+        return (
+            f"The sub-agent '{agent_name}' was not consulted. Its {fetch} lookup costs "
+            f"{fetch_cost:g} bird-coins, but only {budget_before:g} remain. Nothing was executed."
+        )
+    fetched: tuple[str, str] | None = None
+    if fetch:
+        fetched = (
+            fetch,
+            await _information(
+                state, environment, fetch, {}, phase, deadline, trace,
+                requested_by={"action": "consult", "agent": agent_name},
+            ),
+        )
+    # The lookup was charged by its own entry; the consult entry starts after it.
+    consult_budget = budget(state)
     span = (
         trace.tool_start(
             name="consult", args={"agent": agent_name, "request": request}, phase=phase,
-            cost=CONSULT_COST, budget_before=budget_before,
+            cost=CONSULT_COST, budget_before=consult_budget,
         )
         if trace is not None
         else None
@@ -598,7 +633,9 @@ async def _consult_action(
         {"role": "system", "content": sub_agent.system},
         {
             "role": "user",
-            "content": build_user_message(sub_agent, state, query, messages[2:-1], request),
+            "content": build_user_message(
+                sub_agent, state, query, messages[2:-1], request, fetched
+            ),
         },
     ]
     generation = (
@@ -610,10 +647,13 @@ async def _consult_action(
         "agent": agent_name,
         "prompt": [dict(message) for message in prompt],
     }
+    if fetch:
+        event["fetch"] = {"tool": fetch, "cost": fetch_cost}
+    extra = {"fetch": fetch} if fetch else {}
     started = _now()
     try:
         reply = await _bounded(
-            model.chat(prompt), remaining, f"the sub-agent '{agent_name}'"
+            model.chat(prompt), _remaining(deadline), f"the sub-agent '{agent_name}'"
         )
     except SessionExpired as exc:
         elapsed = round(_now() - started, 3)
@@ -627,8 +667,8 @@ async def _consult_action(
         entry = record_action(
             state, "consult", {"agent": agent_name, "request": request},
             {"kind": "cancelled", "content": None, "error": str(exc)},
-            CONSULT_COST, budget_before, phase=phase, timed_out=True,
-            elapsed_seconds=elapsed,
+            CONSULT_COST, consult_budget, phase=phase, timed_out=True,
+            elapsed_seconds=elapsed, **extra,
         )
         if span is not None:
             span.finish(entry)
@@ -645,10 +685,16 @@ async def _consult_action(
         entry = record_action(
             state, "consult", {"agent": agent_name, "request": request},
             {"kind": "model_error", "content": None, "error": str(exc)},
-            CONSULT_COST, budget_before, phase=phase, elapsed_seconds=elapsed,
+            CONSULT_COST, consult_budget, phase=phase, elapsed_seconds=elapsed, **extra,
         )
         if span is not None:
             span.finish(entry)
+        if fetch:
+            return (
+                f"The sub-agent '{agent_name}' call failed and no answer is available. "
+                f"The {fetch} lookup cost {fetch_cost:g} bird-coins and was not refunded.\n"
+                f"Error: {exc}"
+            )
         return (
             f"The sub-agent '{agent_name}' call failed and no answer is available. "
             "The failure does not affect the budget or the score.\n"
@@ -670,13 +716,15 @@ async def _consult_action(
             "kind": "answer", "content": reply.content, "error": None,
             "truncated": reply.truncated,
         },
-        CONSULT_COST, budget_before, phase=phase, elapsed_seconds=elapsed,
+        CONSULT_COST, consult_budget, phase=phase, elapsed_seconds=elapsed, **extra,
     )
     if span is not None:
         span.finish(entry)
     body = f"Sub-agent '{agent_name}' answer:\n{reply.content}"
     if reply.truncated:
         body += "\n[The sub-agent response was cut off by the output token limit.]"
+    if fetch:
+        body += f"\n{fetch} was fetched for the sub-agent (cost {fetch_cost:g})."
     return body
 
 
@@ -836,6 +884,7 @@ async def _session_loop(
             )
         notice = _ignored_notice(parsed)
 
+        action_budget = budget(state)
         try:
             if name == "submit_sql":
                 outcome = await _submit_action(
@@ -856,7 +905,7 @@ async def _session_loop(
                 )
             elif name == "consult":
                 content = await _consult_action(
-                    state, model, harness, args["agent"], args["request"], query,
+                    state, model, harness, environment, args["agent"], args["request"], query,
                     messages, phase, deadline, trace,
                 )
             else:
@@ -865,7 +914,13 @@ async def _session_loop(
                 )
         except SessionExpired as exc:
             return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
-        cost = CONSULT_COST if name == "consult" else ALLOWED_TOOLS[name].cost
+        # A consult observation shows the coins this call actually spent: the
+        # fetch price when a lookup ran, zero otherwise. Other actions keep
+        # their official price.
+        if name == "consult":
+            cost = action_budget - budget(state)
+        else:
+            cost = ALLOWED_TOOLS[name].cost
         messages.append({
             "role": "user",
             "content": _observation(index, phase, name, cost, state, content + notice),

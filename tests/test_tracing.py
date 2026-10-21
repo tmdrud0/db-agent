@@ -496,6 +496,71 @@ class SubAgentTraceTests(TracingSessionTestCase):
         self.assertTrue(generation.ended)
 
 
+class FetchConsultTraceTests(TracingSessionTestCase):
+    def setUp(self):
+        super().setUp()
+        self.harness = load_harness("harness/context_finder")
+
+    def service_handler(self, request):
+        path = request.url.path
+        if path == "/schema":
+            return httpx.Response(200, json={"schema": "RAW-SCHEMA-MARKER"})
+        if path == "/knowledge":
+            return httpx.Response(200, json={"knowledge": "RAW-KNOWLEDGE-MARKER"})
+        return super().service_handler(request)
+
+    def test_the_lookup_is_a_tool_span_and_the_sub_agent_is_a_generation(self):
+        self.actions = [
+            action("consult", agent="schema_finder", request="Extract the used tables."),
+            "Tables: customers.",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payloads = [{
+            "passed": True, "reward": 0.7, "message": "Phase 1 correct!",
+            "phase_completed": 1, "has_follow_up": False,
+        }]
+        with TestClient(self.app()) as client:
+            response = self.run_session(client)
+        self.assertEqual(response.status_code, 200, response.text)
+        state = response.json()["state"]
+
+        spans = self.tool_spans(self.root())
+        self.assertEqual(
+            [span.name for span in spans], ["get_schema", "consult", "submit_sql"]
+        )
+        fetch, consult = spans[:2]
+        self.assertEqual(fetch.initial["input"], {})
+        fetch_update = fetch.updates[0]
+        self.assertEqual(fetch_update["metadata"]["cost"], 1.0)
+        self.assertEqual(fetch_update["metadata"]["budget_before"], 18)
+        self.assertEqual(fetch_update["metadata"]["budget_after"], 17)
+        self.assertEqual(fetch_update["output"], "RAW-SCHEMA-MARKER")
+        consult_update = consult.updates[0]
+        self.assertEqual(consult_update["metadata"]["cost"], 0.0)
+        self.assertEqual(consult_update["metadata"]["budget_before"], 17)
+        self.assertEqual(consult_update["metadata"]["budget_after"], 17)
+        self.assertTrue(fetch.ended)
+        self.assertTrue(consult.ended)
+
+        generations = self.generations(self.root())
+        subagent = next(item for item in generations if "schema_finder" in item.name)
+        self.assertIn("RAW-SCHEMA-MARKER", subagent.initial["input"][1]["content"])
+        self.assertEqual(subagent.updates[0]["output"], "Tables: customers.")
+        for generation in generations:
+            if generation.name == "model_call":
+                self.assertNotIn(
+                    "RAW-SCHEMA-MARKER", json.dumps(generation.initial["input"])
+                )
+        self.assertTrue(all(item.ended for item in self.langfuse.observations))
+        self.assertEqual(
+            [event["type"] for event in state["adk_events"]],
+            ["model_call", "subagent_call", "model_call"],
+        )
+        self.assertEqual(
+            state["adk_events"][1]["fetch"], {"tool": "get_schema", "cost": 1.0}
+        )
+
+
 class FailureTraceTests(TracingSessionTestCase):
     def test_model_failure_marks_only_the_trace_as_an_error(self):
         self.actions = []

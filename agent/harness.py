@@ -5,7 +5,8 @@ A harness is a directory with one required file and three optional ones:
 - ``system.md``: role and solution strategy for the model (required)
 - ``memory.md``: notes shared across tasks (optional)
 - ``tools/<tool name>.md``: usage guidance for one official tool (optional)
-- ``sub_agents/<name>.md``: one sub-agent definition (optional)
+- ``sub_agents/<name>.md``: one sub-agent definition (optional); its ``fetch``
+  header may name one argument-free official lookup to run on each consult
 
 Everything else in the directory is rejected so a typo cannot silently drop a
 file, and so are symbolic links and junctions, so only files that live in the
@@ -19,7 +20,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent.tools import ALLOWED_TOOLS
+from agent.tools import ALLOWED_TOOLS, SUB_AGENT_FETCH_TOOLS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HARNESS_DIR_ENV = "AGENT_HARNESS_DIR"
@@ -29,7 +30,7 @@ MEMORY_FILE = "memory.md"
 TOOLS_DIR = "tools"
 SUB_AGENTS_DIR = "sub_agents"
 SUB_AGENT_NAME = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
-SUB_AGENT_HEADER_KEYS = ("description", "context")
+SUB_AGENT_HEADER_KEYS = ("description", "context", "fetch")
 SUB_AGENT_CONTEXT_ITEMS = ("task", "dialogue", "observations")
 DEFAULT_SUB_AGENT_CONTEXT = ("task", "dialogue")
 
@@ -42,6 +43,7 @@ class SubAgent:
     description: str
     context: tuple[str, ...]
     system: str
+    fetch: str | None = None
 
 
 class HarnessError(ValueError):
@@ -210,10 +212,27 @@ def _parse_sub_agent(name: str, relative: str, text: str) -> SubAgent:
             if value not in items:
                 items.append(value)
         context = tuple(items)
+    fetch = None
+    if "fetch" in header:
+        fetch = header["fetch"]
+        if not fetch:
+            raise HarnessError(f"Sub-agent file {relative} has an empty fetch value")
+        if "," in fetch:
+            raise HarnessError(
+                f"Sub-agent file {relative} names more than one fetch tool '{fetch}'. "
+                "fetch takes exactly one tool name"
+            )
+        if fetch not in SUB_AGENT_FETCH_TOOLS:
+            raise HarnessError(
+                f"Sub-agent file {relative} has an unsupported fetch tool '{fetch}'. "
+                f"Allowed fetch tools: {', '.join(SUB_AGENT_FETCH_TOOLS)}"
+            )
     body = "\n".join(lines[end + 1:]).strip()
     if not body:
         raise HarnessError(f"Sub-agent file {relative} needs a non-empty body")
-    return SubAgent(name=name, description=description, context=context, system=body)
+    return SubAgent(
+        name=name, description=description, context=context, system=body, fetch=fetch
+    )
 
 
 def _digest(files: dict[str, str]) -> str:

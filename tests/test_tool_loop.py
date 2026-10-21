@@ -1481,6 +1481,387 @@ class ConsultTests(ToolLoopTestCase):
         self.assertEqual(self.subagent_events(state)[0]["type"], "subagent_call")
 
 
+FETCHED_SCHEMA_RAW = "RAW-SCHEMA-MARKER\n" + SCHEMA_TEXT
+SCHEMA_FINDER_PROMPT = "You extract schema facts. Copy the fetched text."
+REVIEWER_PROMPT = "You review answers."
+
+
+def fetch_harness(root: Path) -> Path:
+    (root / "sub_agents").mkdir(parents=True)
+    (root / "system.md").write_text("Ask the finders for extracts.\n", encoding="utf-8")
+    (root / "sub_agents" / "schema_finder.md").write_text(
+        "---\n"
+        "description: Extracts schema facts.\n"
+        "context: task, dialogue\n"
+        "fetch: get_schema\n"
+        "---\n"
+        f"{SCHEMA_FINDER_PROMPT}\n",
+        encoding="utf-8",
+    )
+    (root / "sub_agents" / "reviewer.md").write_text(
+        "---\n"
+        "description: Reviews an answer.\n"
+        "context: task, dialogue, observations\n"
+        "---\n"
+        f"{REVIEWER_PROMPT}\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+class FetchConsultTests(ToolLoopTestCase):
+    """A consult whose definition names one argument-free official lookup."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.harness = load_harness(fetch_harness(Path(self._tmp.name) / "fetch-harness"))
+        super().setUp()
+
+    def subagent_events(self, state):
+        return [event for event in state["adk_events"] if event["type"] == "subagent_call"]
+
+    def test_one_consult_fetches_once_charges_once_and_returns_only_the_answer(self):
+        self.info_payloads["/schema"] = {"schema": FETCHED_SCHEMA_RAW}
+        answer = "Tables: customers."
+        request = "Extract the customers table."
+        self.actions = [
+            action("consult", agent="schema_finder", request=request),
+            answer,
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.service_requests, [
+            ("/schema", {"task_id": "test-task"}),
+            ("/submit", {"task_id": "test-task", "sql": "SELECT 1;"}),
+        ])
+        # One main call, exactly one sub-agent call, then the next main call.
+        self.assertEqual(len(self.model_requests), 3)
+        sub_call = self.model_requests[1]
+        self.assertEqual(sub_call["messages"][0], {
+            "role": "system", "content": SCHEMA_FINDER_PROMPT,
+        })
+        context = sub_call["messages"][1]["content"]
+        self.assertIn(f"Fetched get_schema:\n{FETCHED_SCHEMA_RAW}", context)
+        self.assertLess(
+            context.index("Fetched get_schema:"), context.index(f"Request:\n{request}")
+        )
+        self.assertIn("Task:", context)
+        self.assertIn("Dialogue:", context)
+        self.assertNotIn("Observations:", context)
+
+        trajectory = state["tool_trajectory"]
+        self.assertEqual(
+            [entry["tool"] for entry in trajectory], ["get_schema", "consult", "submit_sql"]
+        )
+        fetch = trajectory[0]
+        self.assertEqual(fetch["args"], {})
+        self.assertEqual(fetch["result"], FETCHED_SCHEMA_RAW)
+        self.assertEqual(fetch["cost"], 1.0)
+        self.assertEqual((fetch["budget_before"], fetch["budget_after"]), (18, 17))
+        self.assertEqual(fetch["phase"], 1)
+        self.assertGreaterEqual(fetch["elapsed_seconds"], 0)
+        self.assertEqual(fetch["requested_by"], {"action": "consult", "agent": "schema_finder"})
+        consult = trajectory[1]
+        self.assertEqual(consult["cost"], 0.0)
+        self.assertEqual(consult["fetch"], "get_schema")
+        self.assertEqual((consult["budget_before"], consult["budget_after"]), (17, 17))
+        self.assertEqual(consult["result"]["content"], answer)
+        self.assertEqual(state["budget_remaining"], 14)
+
+        feedback = self.model_requests[2]["messages"][-1]["content"]
+        self.assertIn(f"Sub-agent 'schema_finder' answer:\n{answer}", feedback)
+        self.assertIn("get_schema was fetched for the sub-agent (cost 1).", feedback)
+        self.assertIn("[action 1 | phase 1 | consult | cost 1 | budget 17]", feedback)
+
+        events = self.subagent_events(state)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["fetch"], {"tool": "get_schema", "cost": 1.0})
+        self.assertEqual(events[0]["prompt"], sub_call["messages"])
+
+    def test_two_consults_fetch_and_charge_twice(self):
+        self.info_payloads["/schema"] = {"schema": FETCHED_SCHEMA_RAW}
+        self.actions = [
+            action("consult", agent="schema_finder", request="First."),
+            "First answer.",
+            action("consult", agent="schema_finder", request="Second."),
+            "Second answer.",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/schema", "/schema", "/submit"])
+        self.assertEqual(
+            [entry["tool"] for entry in state["tool_trajectory"]],
+            ["get_schema", "consult", "get_schema", "consult", "submit_sql"],
+        )
+        self.assertEqual(
+            [entry["cost"] for entry in state["tool_trajectory"]],
+            [1.0, 0.0, 1.0, 0.0, 3.0],
+        )
+        self.assertEqual(state["budget_remaining"], 13)
+        self.assertEqual(len(self.subagent_events(state)), 2)
+        self.assertNotIn("cached", state["tool_trajectory"][2])
+        self.assertEqual(state["tool_trajectory"][2]["result"], FETCHED_SCHEMA_RAW)
+
+    def test_the_raw_output_never_enters_the_main_dialogue_or_another_sub_agent(self):
+        self.info_payloads["/schema"] = {"schema": FETCHED_SCHEMA_RAW}
+        self.actions = [
+            action("consult", agent="schema_finder", request="Extract."),
+            "SCHEMA-ANSWER",
+            action("consult", agent="reviewer", request="Check."),
+            "REVIEW-ANSWER",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        # The main call after the consult sees the answer and the fetch notice only.
+        next_main = self.model_requests[2]
+        self.assertNotIn(
+            "RAW-SCHEMA-MARKER", json.dumps(next_main, ensure_ascii=False)
+        )
+        self.assertIn("SCHEMA-ANSWER", next_main["messages"][-1]["content"])
+        self.assertIn(
+            "get_schema was fetched for the sub-agent (cost 1).",
+            next_main["messages"][-1]["content"],
+        )
+
+        # The observations context of another sub-agent is built from the main
+        # dialogue, so the raw output is absent there too.
+        other = self.model_requests[3]["messages"][1]["content"]
+        self.assertNotIn("RAW-SCHEMA-MARKER", other)
+        self.assertIn("SCHEMA-ANSWER", other)
+        self.assertIn("get_schema was fetched for the sub-agent (cost 1).", other)
+        self.assertIn("Request:\nCheck.", other)
+
+        # The replayed prompt of the next main call is the same dialogue.
+        self.assertEqual(model_events(state)[1]["prompt"], next_main["messages"])
+        for event in model_events(state):
+            self.assertNotIn("RAW-SCHEMA-MARKER", json.dumps(event["prompt"]))
+        # The sub-agent event keeps the prompt it actually sent, raw output included.
+        self.assertIn(
+            "RAW-SCHEMA-MARKER",
+            self.subagent_events(state)[0]["prompt"][1]["content"],
+        )
+
+    def test_a_phase_two_consult_fetches_the_current_state_once(self):
+        self.state["current_phase"] = 2
+        self.state["phase1_completed"] = True
+        self.state["follow_up_query"] = "And by region?"
+        self.info_payloads["/schema"] = {"schema": FETCHED_SCHEMA_RAW}
+        self.actions = [
+            action("consult", agent="schema_finder", request="Extract for the follow-up."),
+            "Tables: customers.",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE2_PASS)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/schema", "/submit"])
+        fetch = state["tool_trajectory"][0]
+        self.assertEqual(fetch["tool"], "get_schema")
+        self.assertEqual(fetch["phase"], 2)
+        self.assertEqual(fetch["cost"], 1.0)
+        sub_context = self.model_requests[1]["messages"][1]["content"]
+        self.assertIn("Phase: 2", sub_context)
+        self.assertIn("Follow-up question:\nAnd by region?", sub_context)
+        self.assertIn(f"Fetched get_schema:\n{FETCHED_SCHEMA_RAW}", sub_context)
+
+    def test_a_consult_without_fetch_keeps_the_task_013_record(self):
+        self.actions = [
+            action("consult", agent="reviewer", request="Check this."),
+            "No problems found.",
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/submit"])
+        consult = state["tool_trajectory"][0]
+        self.assertEqual(consult["tool"], "consult")
+        self.assertEqual(consult["cost"], 0.0)
+        self.assertNotIn("fetch", consult)
+        self.assertEqual(consult["result"], {
+            "kind": "answer", "content": "No problems found.", "error": None,
+            "truncated": False,
+        })
+        self.assertNotIn("fetch", self.subagent_events(state)[0])
+        sub_context = self.model_requests[1]["messages"][1]["content"]
+        self.assertNotIn("Fetched ", sub_context)
+        feedback = self.model_requests[2]["messages"][-1]["content"]
+        self.assertIn("[action 1 | phase 1 | consult | cost 0 | budget 18]", feedback)
+        self.assertNotIn("was fetched", feedback)
+
+
+class FetchConsultFailureTests(unittest.IsolatedAsyncioTestCase):
+    """Fetch errors follow the official lookup contract; model errors do not."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.harness = load_harness(fetch_harness(Path(self._tmp.name) / "fetch-harness"))
+        self.actions = []
+        self.model_requests = []
+        self.service_requests = []
+
+    def state(self, budget: float = 18) -> dict:
+        return {
+            "task_id": "test-task", "db_name": "demo", "user_query": "How many customers?",
+            "budget_remaining": budget, "initial_budget": budget,
+            "total_reward": 0.0, "tool_trajectory": [], "adk_events": [],
+            "current_phase": 1,
+        }
+
+    def client(self) -> ModelClient:
+        def handler(request):
+            self.model_requests.append(json.loads(request.content))
+            return httpx.Response(200, json=model_reply(self.actions.pop(0)))
+
+        return ModelClient(transport=httpx.MockTransport(handler), api_key="test-key")
+
+    def environment(self, handler) -> Environment:
+        return Environment(httpx.MockTransport(handler))
+
+    async def test_a_fetch_service_error_is_a_session_failure(self):
+        def handler(request):
+            self.service_requests.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(200, json={"schema": 5})
+
+        self.actions = [action("consult", agent="schema_finder", request="Extract.")]
+        state = self.state()
+        with self.assertRaises(GradingError):
+            await tool_loop.run(
+                state, "Answer.", self.environment(handler), self.client(),
+                harness=self.harness,
+            )
+
+        self.assertEqual(state["failure"]["stage"], "information")
+        self.assertIn("did not contain a schema string", state["failure"]["message"])
+        self.assertEqual(state["budget_remaining"], 17)
+        self.assertEqual([entry["tool"] for entry in state["tool_trajectory"]], ["get_schema"])
+        self.assertEqual(
+            state["tool_trajectory"][0]["requested_by"],
+            {"action": "consult", "agent": "schema_finder"},
+        )
+        self.assertNotIn("loop_stopped", state)
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual([path for path, _ in self.service_requests], ["/schema"])
+
+    async def test_a_fetch_timeout_ends_the_session_with_the_standard_reason(self):
+        async def handler(request):
+            self.service_requests.append((request.url.path, json.loads(request.content)))
+            await asyncio.sleep(1.0)
+            return httpx.Response(200, json={"schema": SCHEMA_TEXT})
+
+        self.actions = [action("consult", agent="schema_finder", request="Extract.")]
+        state = self.state()
+        with mock.patch.object(tool_loop, "SESSION_TIME_LIMIT_SECONDS", 0.2):
+            await tool_loop.run(
+                state, "Answer.", self.environment(handler), self.client(),
+                harness=self.harness,
+            )
+
+        self.assertEqual(state["stop_reason"], "session_time_limit")
+        self.assertIn("session limit", state["final_response"])
+        self.assertEqual(state["budget_remaining"], 17)
+        self.assertEqual([entry["tool"] for entry in state["tool_trajectory"]], ["get_schema"])
+        self.assertTrue(state["tool_trajectory"][0]["timed_out"])
+        self.assertNotIn("failure", state)
+        self.assertEqual(len(self.model_requests), 1)
+
+    async def test_a_sub_agent_model_error_after_a_fetch_keeps_the_session_and_the_charge(self):
+        def handler(request):
+            body = json.loads(request.content)
+            self.model_requests.append(body)
+            if body["messages"][0]["content"] == SCHEMA_FINDER_PROMPT:
+                return httpx.Response(500, json={"error": {"message": "boom"}})
+            return httpx.Response(200, json=model_reply(self.actions.pop(0)))
+
+        self.actions = [
+            action("consult", agent="schema_finder", request="Extract."),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+
+        def service_handler(request):
+            path = request.url.path
+            payload = json.loads(request.content)
+            self.service_requests.append((path, payload))
+            if path == "/schema":
+                return httpx.Response(200, json={"schema": FETCHED_SCHEMA_RAW})
+            return httpx.Response(200, json=dict(PHASE1_FINAL))
+
+        state = self.state()
+        client = ModelClient(transport=httpx.MockTransport(handler), api_key="test-key")
+        await tool_loop.run(
+            state, "Answer.", self.environment(service_handler), client, harness=self.harness,
+        )
+
+        self.assertNotIn("failure", state)
+        self.assertEqual(state["stop_reason"], "phase1_completed")
+        self.assertEqual(state["budget_remaining"], 14)
+        self.assertEqual(
+            [entry["tool"] for entry in state["tool_trajectory"]],
+            ["get_schema", "consult", "submit_sql"],
+        )
+        self.assertEqual(state["tool_trajectory"][0]["cost"], 1.0)
+        consult = state["tool_trajectory"][1]
+        self.assertEqual(consult["cost"], 0.0)
+        self.assertEqual(consult["fetch"], "get_schema")
+        self.assertEqual(consult["result"]["kind"], "model_error")
+        self.assertIn(f"after {MAX_RETRIES + 1} attempts", consult["result"]["error"])
+
+        feedback = self.model_requests[-1]["messages"][-1]["content"]
+        self.assertIn("The sub-agent 'schema_finder' call failed", feedback)
+        self.assertIn(
+            "The get_schema lookup cost 1 bird-coins and was not refunded.", feedback
+        )
+        subagent = next(
+            event for event in state["adk_events"] if event["type"] == "subagent_call"
+        )
+        self.assertEqual(subagent["fetch"], {"tool": "get_schema", "cost": 1.0})
+        self.assertIn("error", subagent)
+        self.assertEqual(tool_loop._model_actions(state), 2)
+        # One main call, the failed sub-agent attempts, then the next main call.
+        self.assertEqual(len(self.model_requests), MAX_RETRIES + 3)
+
+    async def test_a_budget_below_the_fetch_cost_refuses_without_any_call(self):
+        def handler(request):
+            raise AssertionError("refused consult must not reach a service")
+
+        def model_handler(request):
+            raise AssertionError("refused consult must not call a model")
+
+        state = self.state(budget=0.5)
+        client = ModelClient(
+            transport=httpx.MockTransport(model_handler), api_key="test-key"
+        )
+        messages = [
+            {"role": "system", "content": "contract"},
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": action("consult", agent="schema_finder", request="Extract."),
+            },
+        ]
+        body = await tool_loop._consult_action(
+            state, client, self.harness, self.environment(handler), "schema_finder",
+            "Extract.", "How many customers?", messages, 1,
+            tool_loop._now() + 60.0,
+        )
+
+        self.assertIn("was not consulted", body)
+        self.assertIn("costs 1 bird-coins", body)
+        self.assertEqual(state["budget_remaining"], 0.5)
+        self.assertEqual(state.get("tool_trajectory", []), [])
+        self.assertEqual(state.get("adk_events", []), [])
+        self.assertEqual(self.service_requests, [])
+        self.assertEqual(self.model_requests, [])
+
+
 class MultipleActionAndStatementTests(ToolLoopTestCase):
     """Accepted multi-action responses and rejected multi-statement exploration."""
 

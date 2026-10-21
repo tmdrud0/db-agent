@@ -70,12 +70,64 @@ def sub_agent_text(
     description: str = "Reviews SQL.",
     context: str | None = None,
     body: str = "Review the SQL.",
+    fetch: str | None = None,
 ) -> str:
     lines = ["---", f"description: {description}"]
     if context is not None:
         lines.append(f"context: {context}")
+    if fetch is not None:
+        lines.append(f"fetch: {fetch}")
     lines.extend(["---", body, ""])
     return "\n".join(lines)
+
+
+# The prompt harness/sql_review produced at the TASK-013 code SHA. The fetch
+# work must not change a harness without fetch definitions.
+EXPECTED_SQL_REVIEW_PROMPT = """You solve PostgreSQL tasks for a benchmark by choosing exactly one action per turn.
+Every action costs bird-coins from a fixed budget, so spend coins only on actions that
+improve your final SQL.
+
+Before you submit, consult the sql_reviewer sub-agent with the candidate SQL and the
+conditions you believe the question requires. It compares the SQL with the question, the
+user's answers and what you have observed, and its review costs no bird-coins.
+
+Reply with one JSON object and nothing else:
+{"action": "<tool name>", "args": {<tool arguments>}}
+
+Available actions:
+- get_schema: the database schema (CREATE TABLE statements). arguments: none. Cost: 1
+- get_all_column_meanings: the meanings of all database columns. arguments: none. Cost: 1
+- get_column_meaning: the meaning of one column. arguments: {"table_name": "<table>", "column_name": "<column>"}. Cost: 0.5
+- get_all_external_knowledge_names: the names of the external knowledge entries for this database. arguments: none. Cost: 0.5
+- get_knowledge_definition: the definition of one external knowledge entry. arguments: {"knowledge_name": "<name>"}. Cost: 0.5
+- get_all_knowledge_definitions: the definitions of all external knowledge entries. arguments: none. Cost: 1
+- execute_sql: run one read-only statement against the task database and see its result as exploration. arguments: {"sql": "<one PostgreSQL statement starting with SELECT, WITH or EXPLAIN>"}. Cost: 1
+- ask_user: ask the task user one clarification question and see the official answer. arguments: {"question": "<one question for the task user>"}. Cost: 2
+- submit_sql: submit one SQL statement to the official grader; only a passing submission completes the task. arguments: {"sql": "<PostgreSQL statement>"}. Cost: 3
+- consult: ask one harness sub-agent for an answer; the answer is an observation and never changes the score. arguments: {"agent": "<sub-agent name>", "request": "<what the sub-agent should do>"}. Cost: 0
+  Available sub-agents:
+  - sql_reviewer: Checks a candidate PostgreSQL query against the question, the user answers and the agent's observations.
+
+Rules:
+- Only the actions above exist. Any other action name is rejected without cost.
+- execute_sql explores with one read-only statement. Its result never changes the score
+  and never replaces submit_sql; an official SQL error is an observation, not a penalty.
+- ask_user receives the official answer of the task user. The answer is an observation;
+  decide yourself whether and when to ask.
+- A call is charged its coin cost when it starts; a failed or interrupted call is not
+  refunded.
+- A failed submission can be retried while the budget lasts. The official rewards are 0.7
+  for phase 1 and 0.3 for phase 2.
+- A passing phase 1 submission applies its SQL to the database and starts phase 2 with a
+  follow-up question.
+- The session stops after 24 model actions or 1500 seconds, and it stops when fewer than 3 bird-coins remain because a submission would no longer be possible.
+- consult calls one sub-agent defined by the harness. It is not an official tool
+  and costs no bird-coins, but the response that chooses it still counts as one model
+  action.
+- A sub-agent cannot use the database, the user simulator or the grader. It sees only
+  the context listed with its name and the request, and its answer is an observation
+  that never changes the score.
+"""
 
 
 class HarnessTestCase(unittest.TestCase):
@@ -217,6 +269,37 @@ class AssemblyTests(HarnessTestCase):
         self.assertNotIn("consult", prompt)
         self.assertNotIn("sub-agent", prompt)
 
+    def test_a_fetch_sub_agent_shows_its_lookup_and_the_fetch_contract(self):
+        self.write("system.md", "Guidance.")
+        self.write(
+            "sub_agents/knowledge_finder.md",
+            sub_agent_text(fetch="get_all_knowledge_definitions"),
+        )
+        prompt = system_prompt(self.load())
+
+        self.assertIn(
+            "  - knowledge_finder: Reviews SQL. Fetches get_all_knowledge_definitions (cost 1).",
+            prompt,
+        )
+        self.assertIn(
+            '- A sub-agent listed with "Fetches <tool> (cost <n>)" receives that official\n'
+            "  lookup when it is consulted. The lookup runs once, is charged its official coin\n"
+            "  cost, and its raw output is shown only to the sub-agent; the main agent receives\n"
+            "  only the sub-agent's answer.",
+            prompt,
+        )
+        for line in catalog().splitlines():
+            self.assertIn(line, prompt)
+
+    def test_sub_agents_without_fetch_keep_the_task_013_prompt(self):
+        self.write("system.md", "Guidance.")
+        self.write("sub_agents/reviewer.md", sub_agent_text())
+        prompt = system_prompt(self.load())
+
+        self.assertNotIn("Fetches", prompt)
+        self.assertNotIn("receives that official", prompt)
+        self.assertIn("  - reviewer: Reviews SQL.", prompt)
+
 
 class SubAgentTests(HarnessTestCase):
     def test_a_definition_loads_with_its_description_context_and_body(self):
@@ -238,6 +321,43 @@ class SubAgentTests(HarnessTestCase):
         self.assertEqual(
             self.load().sub_agents["reviewer"].context, ("task", "dialogue")
         )
+        self.assertIsNone(self.load().sub_agents["reviewer"].fetch)
+
+    def test_the_four_argument_free_lookups_load_as_fetch(self):
+        self.write("system.md", "Guidance.")
+        for tool in (
+            "get_schema",
+            "get_all_column_meanings",
+            "get_all_external_knowledge_names",
+            "get_all_knowledge_definitions",
+        ):
+            with self.subTest(tool=tool):
+                self.write("sub_agents/finder.md", sub_agent_text(fetch=tool))
+                self.assertEqual(self.load().sub_agents["finder"].fetch, tool)
+
+    def test_invalid_fetch_values_fail(self):
+        cases = {
+            "empty": sub_agent_text(fetch=""),
+            "multiple tools": sub_agent_text(fetch="get_schema, get_all_column_meanings"),
+            "argument lookup": sub_agent_text(fetch="get_column_meaning"),
+            "single knowledge lookup": sub_agent_text(fetch="get_knowledge_definition"),
+            "execute_sql": sub_agent_text(fetch="execute_sql"),
+            "ask_user": sub_agent_text(fetch="ask_user"),
+            "submit_sql": sub_agent_text(fetch="submit_sql"),
+            "unknown tool": sub_agent_text(fetch="get_everything"),
+            "duplicate key": (
+                "---\ndescription: Reviews SQL.\n"
+                "fetch: get_schema\nfetch: get_all_knowledge_definitions\n"
+                "---\nReview the SQL.\n"
+            ),
+        }
+        for index, (case, text) in enumerate(cases.items()):
+            with self.subTest(case=case):
+                directory = self.harness(f"invalid-fetch-{index}", {
+                    "system.md": "x", "sub_agents/reviewer.md": text,
+                })
+                with self.assertRaises(HarnessError):
+                    load_harness(directory)
 
     def test_context_items_keep_their_declared_order_and_drop_duplicates(self):
         self.write("system.md", "Guidance.")
@@ -319,18 +439,61 @@ class SubAgentTests(HarnessTestCase):
 
 
 class ExampleHarnessTests(unittest.TestCase):
+    def test_the_sql_review_prompt_is_the_task_013_text(self):
+        self.assertEqual(
+            system_prompt(load_harness("harness/sql_review")), EXPECTED_SQL_REVIEW_PROMPT
+        )
+
     def test_the_sql_review_example_loads_and_reaches_the_prompt(self):
         harness = load_harness("harness/sql_review")
         self.assertEqual(harness.name, "sql_review")
         self.assertEqual(list(harness.sub_agents), ["sql_reviewer"])
         sub = harness.sub_agents["sql_reviewer"]
         self.assertEqual(sub.context, ("task", "dialogue", "observations"))
+        self.assertIsNone(sub.fetch)
         self.assertTrue(sub.description)
         prompt = system_prompt(harness)
         self.assertIn("- consult:", prompt)
         self.assertIn("  - sql_reviewer:", prompt)
         self.assertIn(sub.description, prompt)
         self.assertIn("Before you submit, consult the sql_reviewer sub-agent", prompt)
+        self.assertNotIn("Fetches", prompt)
+
+    def test_the_context_finder_example_loads_with_its_three_fetches(self):
+        harness = load_harness("harness/context_finder")
+        self.assertEqual(harness.name, "context_finder")
+        self.assertEqual(
+            {name: sub.fetch for name, sub in harness.sub_agents.items()},
+            {
+                "column_finder": "get_all_column_meanings",
+                "knowledge_finder": "get_all_knowledge_definitions",
+                "schema_finder": "get_schema",
+            },
+        )
+        prompt = system_prompt(harness)
+        for name, sub in harness.sub_agents.items():
+            self.assertEqual(sub.context, ("task", "dialogue"))
+            self.assertIn(
+                f"  - {name}: {sub.description} "
+                f"Fetches {sub.fetch} (cost {TOOL_COSTS[sub.fetch]:g}).",
+                prompt,
+            )
+        self.assertIn("ask a\nfinder sub-agent", prompt)
+        self.assertIn("- consult:", prompt)
+        self.assertNotIn("sql_reviewer", prompt)
+
+    def test_all_three_harnesses_expose_only_the_official_tools(self):
+        for directory in ("harness/baseline", "harness/sql_review", "harness/context_finder"):
+            with self.subTest(directory=directory):
+                client = TestClient(create_app(harness=load_harness(directory)))
+                health = client.get("/health").json()
+                self.assertEqual(
+                    [tool["name"] for tool in health["tools"]], list(TOOL_COSTS)
+                )
+                self.assertEqual(
+                    health["tools"],
+                    [{"name": name, "cost": cost} for name, cost in TOOL_COSTS.items()],
+                )
 
     def test_health_reports_sub_agents_without_changing_the_tool_set(self):
         client = TestClient(create_app(harness=load_harness("harness/sql_review")))
@@ -340,6 +503,12 @@ class ExampleHarnessTests(unittest.TestCase):
 
         baseline = TestClient(create_app(harness=load_harness("harness/baseline")))
         self.assertEqual(baseline.get("/health").json()["harness"]["sub_agents"], [])
+
+        finder = TestClient(create_app(harness=load_harness("harness/context_finder")))
+        self.assertEqual(
+            finder.get("/health").json()["harness"]["sub_agents"],
+            ["column_finder", "knowledge_finder", "schema_finder"],
+        )
 
 
 class ValidationTests(HarnessTestCase):

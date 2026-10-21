@@ -88,6 +88,16 @@ async def _all_knowledge(environment: Environment, task_id: str, args: dict) -> 
     return await environment.fetch_knowledge(task_id)
 
 
+# The information tools a sub-agent's ``fetch`` header may name. Each takes no
+# arguments, so one consult can run exactly one official lookup without a
+# tool-selection loop inside the sub-agent.
+SUB_AGENT_FETCH_TOOLS = (
+    "get_schema",
+    "get_all_column_meanings",
+    "get_all_external_knowledge_names",
+    "get_all_knowledge_definitions",
+)
+
 INFORMATION_TOOLS = {
     "get_schema": ToolSpec(
         name="get_schema", cost=1.0, arguments="none",
@@ -180,14 +190,22 @@ def catalog(notes: dict[str, str] | None = None) -> str:
     return "\n".join(lines)
 
 
-def consult_catalog(agents: Iterable[tuple[str, str]]) -> str:
-    """The consult line and the available sub-agents, appended inside the catalog."""
+def consult_catalog(agents: Iterable[tuple[str, str, str | None]]) -> str:
+    """The consult line and the available sub-agents, appended inside the catalog.
+
+    A sub-agent with a ``fetch`` tool shows that official lookup and its price
+    on its line, so the model can see which consult spends coins.
+    """
     lines = [
         f"- {CONSULT_SPEC.name}: {CONSULT_SPEC.summary}. arguments: {CONSULT_SPEC.arguments}. "
         f"Cost: {CONSULT_SPEC.cost:g}",
         "  Available sub-agents:",
     ]
-    lines.extend(f"  - {name}: {description}" for name, description in agents)
+    for name, description, fetch in agents:
+        line = f"  - {name}: {description}"
+        if fetch:
+            line += f" Fetches {fetch} (cost {ALLOWED_TOOLS[fetch].cost:g})."
+        lines.append(line)
     return "\n".join(lines)
 
 

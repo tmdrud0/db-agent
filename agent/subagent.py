@@ -2,8 +2,9 @@
 
 A sub-agent sees only its definition body and one user message built here. The
 message holds the context items its definition asks for, in the declared order,
-followed by the requesting agent's request. Nothing else from the session,
-the environment or the local filesystem is added.
+then the raw output of the official lookup named by ``fetch`` (when present),
+and finally the requesting agent's request. Nothing else from the session or
+the local filesystem is added.
 """
 
 from agent.harness import SubAgent
@@ -59,13 +60,22 @@ def build_user_message(
     query: str,
     history: list[dict],
     request: str,
+    fetched: tuple[str, str] | None = None,
 ) -> str:
-    """The one user message of a sub-agent call."""
+    """The one user message of a sub-agent call.
+
+    ``fetched`` carries the raw output of the official lookup the definition
+    names in ``fetch``. It sits after the declared context items and before the
+    request, and never enters the main agent's dialogue.
+    """
     builders = {
         "task": lambda: _task(state, query),
         "dialogue": lambda: _dialogue(state),
         "observations": lambda: _observations(history),
     }
     parts = [builders[item]() for item in sub_agent.context]
+    if fetched is not None:
+        tool, content = fetched
+        parts.append(f"Fetched {tool}:\n{content}")
     parts.append(f"Request:\n{request}")
     return "\n\n".join(parts) + "\n"
