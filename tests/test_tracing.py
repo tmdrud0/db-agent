@@ -124,6 +124,8 @@ def recording_tracer(client=None, **overrides):
         "code_version": "abc123-dirty",
         "agent_name": AGENT_NAME,
         "model_id": MODEL_ID,
+        "harness_name": "baseline",
+        "harness_sha256": "a" * 64,
     }
     options.update(overrides)
     return LangfuseTracer(client, lambda **kwargs: nullcontext(), **options), client
@@ -237,6 +239,8 @@ class SuccessfulTraceTests(TracingSessionTestCase):
         self.assertEqual(metadata["model"], MODEL_ID)
         self.assertEqual(metadata["eval_run_id"], "eval-run-1")
         self.assertEqual(metadata["code_version"], "abc123-dirty")
+        self.assertEqual(metadata["harness_name"], "baseline")
+        self.assertEqual(metadata["harness_sha256"], "a" * 64)
         self.assertTrue(root.ended)
 
         # The trace output and scores come from the official state.
@@ -784,8 +788,11 @@ class DisabledTracingTests(unittest.TestCase):
             [entry["tool"] for entry in right["tool_trajectory"]],
         )
         self.assertEqual(
-            [event["action"] for event in left["adk_events"]],
-            [event["action"] for event in right["adk_events"]],
+            [event.get("action") for event in left["adk_events"]],
+            [event.get("action") for event in right["adk_events"]],
+        )
+        self.assertEqual(
+            left["adk_events"][0]["harness"], right["adk_events"][0]["harness"]
         )
 
 
@@ -837,6 +844,23 @@ class ServerTracerLifecycleTests(TracingSessionTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(factory.call_count, 1)
         self.assertEqual(len(langfuse.roots), 1)
+
+    def test_lifespan_passes_the_harness_identity_to_the_tracer(self):
+        app = create_app(
+            Environment(httpx.MockTransport(self.service_handler)),
+            ModelClient(
+                transport=httpx.MockTransport(self.model_handler), api_key="test-key"
+            ),
+            mode="tools",
+        )
+        with mock.patch.object(
+            server_module, "create_tracer", return_value=NoopTracer()
+        ) as factory:
+            with TestClient(app):
+                pass
+        options = factory.call_args.kwargs
+        self.assertEqual(options["harness_name"], "baseline")
+        self.assertEqual(len(options["harness_sha256"]), 64)
 
     def test_an_injected_tracer_is_not_replaced_by_the_lifespan(self):
         self.actions = [action("submit_sql", sql="SELECT 1;")]

@@ -13,6 +13,7 @@ import json
 import time
 
 from agent.environment import Environment, ExecuteResult, GradingError
+from agent.harness import Harness
 from agent.model import (
     API_URL,
     MAX_OUTPUT_TOKENS,
@@ -37,7 +38,6 @@ from agent.tools import (
     ParsedAction,
     catalog,
     parse_response,
-    submission_key,
 )
 from agent.tracing import Generation, SessionTrace, Tracer
 
@@ -78,39 +78,45 @@ async def _bounded(awaitable, remaining: float, label: str):
         ) from exc
 
 
-SYSTEM_PROMPT = (
-    "You solve PostgreSQL tasks for a benchmark by choosing exactly one action per turn.\n"
-    "Every action costs bird-coins from a fixed budget, so spend coins only on actions that\n"
-    "improve your final SQL.\n"
-    "\n"
-    "Reply with one JSON object and nothing else:\n"
-    '{"action": "<tool name>", "args": {<tool arguments>}}\n'
-    "\n"
-    "Available actions:\n"
-    f"{catalog()}\n"
-    "\n"
-    "Rules:\n"
-    "- Only the actions above exist. Any other action name is rejected without cost.\n"
-    "- An information request that repeats an earlier one is answered from the session cache;\n"
-    "  its coin cost still applies. execute_sql and ask_user are never cached: every call is\n"
-    "  sent to the official service again and charged, because the database and the phase\n"
-    "  can have changed.\n"
-    "- execute_sql explores with one read-only statement. Its result never changes the score\n"
-    "  and never replaces submit_sql; an official SQL error is an observation, not a penalty.\n"
-    "- ask_user receives the official answer of the task user. The answer is an observation;\n"
-    "  decide yourself whether and when to ask.\n"
-    "- A call is charged its coin cost when it starts; a failed or interrupted call is not\n"
-    "  refunded.\n"
-    "- Submitting the same SQL text twice in one phase is rejected without cost; revise the SQL\n"
-    "  before submitting again.\n"
-    "- A failed submission can be retried while the budget lasts. The official rewards are 0.7\n"
-    "  for phase 1 and 0.3 for phase 2.\n"
-    "- A passing phase 1 submission applies its SQL to the database and starts phase 2 with a\n"
-    "  follow-up question.\n"
-    f"- The session stops after {MAX_MODEL_ACTIONS} model actions or "
-    f"{SESSION_TIME_LIMIT_SECONDS:.0f} seconds, and it stops when fewer than "
-    f"{SUBMIT_COST:g} bird-coins remain because a submission would no longer be possible.\n"
-)
+def system_prompt(harness: Harness) -> str:
+    """Assemble the harness guidance and the code-owned contract.
+
+    Order: harness ``system.md``, code contract, harness ``memory.md``. The
+    contract (response format, tools, prices, limits, rewards, phase rules) is
+    always the text built here; harness files cannot replace it.
+    """
+    contract = (
+        "Reply with one JSON object and nothing else:\n"
+        '{"action": "<tool name>", "args": {<tool arguments>}}\n'
+        "\n"
+        "Available actions:\n"
+        f"{catalog(harness.tool_notes)}\n"
+        "\n"
+        "Rules:\n"
+        "- Only the actions above exist. Any other action name is rejected without cost.\n"
+        "- execute_sql explores with one read-only statement. Its result never changes the score\n"
+        "  and never replaces submit_sql; an official SQL error is an observation, not a penalty.\n"
+        "- ask_user receives the official answer of the task user. The answer is an observation;\n"
+        "  decide yourself whether and when to ask.\n"
+        "- A call is charged its coin cost when it starts; a failed or interrupted call is not\n"
+        "  refunded.\n"
+        "- A failed submission can be retried while the budget lasts. The official rewards are 0.7\n"
+        "  for phase 1 and 0.3 for phase 2.\n"
+        "- A passing phase 1 submission applies its SQL to the database and starts phase 2 with a\n"
+        "  follow-up question.\n"
+        f"- The session stops after {MAX_MODEL_ACTIONS} model actions or "
+        f"{SESSION_TIME_LIMIT_SECONDS:.0f} seconds, and it stops when fewer than "
+        f"{SUBMIT_COST:g} bird-coins remain because a submission would no longer be possible."
+    )
+    parts = []
+    guidance = harness.system.strip("\n")
+    if guidance.strip():
+        parts.append(guidance)
+    parts.append(contract)
+    memory = harness.memory.strip()
+    if memory:
+        parts.append(f"Harness memory:\n{memory}")
+    return "\n\n".join(parts) + "\n"
 
 
 def _now() -> float:
@@ -161,25 +167,6 @@ def _model_actions(state: dict) -> int:
     return sum(1 for event in state.get("adk_events", []) if event.get("type") == "model_call")
 
 
-def _is_duplicate_submission(state: dict, sql: str, phase: int) -> bool:
-    key = submission_key(sql)
-    return any(
-        attempt["phase"] == phase and submission_key(attempt["sql"]) == key
-        for attempt in state.get("submit_attempts", [])
-    )
-
-
-def _cached_result(state: dict, name: str, args: dict) -> str | None:
-    for entry in state.get("tool_trajectory", []):
-        if (
-            entry.get("tool") == name
-            and entry.get("args") == args
-            and isinstance(entry.get("result"), str)
-        ):
-            return entry["result"]
-    return None
-
-
 async def _model_call(
     state: dict,
     model: ModelClient,
@@ -209,6 +196,7 @@ async def _model_call(
     events = state.setdefault("adk_events", [])
     event = {
         "type": "model_call",
+        "harness": state.get("harness"),
         "call_index": 1 + _model_actions(state),
         "phase": phase,
         "request_model": MODEL_ID,
@@ -239,24 +227,6 @@ async def _information(
 ) -> str:
     spec = ALLOWED_TOOLS[name]
     budget_before = budget(state)
-    cached = _cached_result(state, name, args)
-    if cached is not None:
-        # The repeated request is not sent again, but the official price still applies.
-        span = (
-            trace.tool_start(
-                name=name, args=args, phase=phase, cost=spec.cost, budget_before=budget_before
-            )
-            if trace is not None
-            else None
-        )
-        state["budget_remaining"] = budget_before - spec.cost
-        entry = record_action(
-            state, name, args, {"cache_hit": True}, spec.cost, budget_before,
-            phase=phase, cached=True,
-        )
-        if span is not None:
-            span.finish(entry)
-        return f"Served from the session cache; the same request was already made.\n{cached}"
     remaining = _remaining(deadline)
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before {name} could start")
@@ -308,33 +278,8 @@ async def _submit_action(
     trace: SessionTrace | None = None,
     notice: str = "",
 ) -> tuple[str, str] | None:
-    """Submit, or report a blocked duplicate. Returns the stop reason when the task ends."""
+    """Submit to the official grader. Returns the stop reason when the task ends."""
     budget_before = budget(state)
-    if _is_duplicate_submission(state, sql, phase):
-        span = (
-            trace.tool_start(
-                name="submit_sql", args={"sql": sql}, phase=phase, cost=0.0,
-                budget_before=budget_before,
-            )
-            if trace is not None
-            else None
-        )
-        entry = record_action(
-            state, "submit_sql", {"sql": sql}, {"duplicate_sql": True}, 0.0, budget_before,
-            phase=phase, blocked="duplicate_sql",
-        )
-        if span is not None:
-            span.finish(entry)
-        body = (
-            f"The same SQL text was already submitted in phase {phase} and was not sent again. "
-            "Revise the SQL before submitting." + notice
-        )
-        messages.append({
-            "role": "user",
-            "content": _observation(index, phase, "submit_sql", 0.0, state, body),
-        })
-        return None
-
     remaining = _remaining(deadline)
     if remaining <= 0:
         raise SessionExpired(f"{_limit_text()} was reached before the submission could start")
@@ -586,13 +531,27 @@ async def _ask_action(
     return f"User answer:\n{answer}"
 
 
+def _record_harness(state: dict, harness: Harness) -> None:
+    """Keep the harness identity in the session state.
+
+    The evaluation runner copies only a whitelist of state fields into the
+    result JSON. Each model_call event also carries this descriptor, so the
+    harness stays visible in every stored task result without changing the
+    meaning or order of the model-call events.
+    """
+    state["harness"] = harness.descriptor()
+
+
 async def run(
     state: dict,
     message: str,
     environment: Environment,
     model: ModelClient,
     tracer: Tracer | None = None,
+    *,
+    harness: Harness,
 ) -> str:
+    _record_harness(state, harness)
     # Repeated requests return the cached outcome instead of calling out again.
     if state.get("loop_stopped"):
         return state["final_response"]
@@ -608,7 +567,7 @@ async def run(
         except Exception:
             trace = None
     try:
-        response = await _session_loop(state, query, environment, model, trace)
+        response = await _session_loop(state, query, environment, model, trace, harness)
     except ModelError as exc:
         if trace is not None:
             trace.fail("model", str(exc))
@@ -634,11 +593,12 @@ async def _session_loop(
     environment: Environment,
     model: ModelClient,
     trace: SessionTrace | None,
+    harness: Harness,
 ) -> str:
     started = _now()
     deadline = started + SESSION_TIME_LIMIT_SECONDS
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt(harness)},
         {"role": "user", "content": _initial_prompt(state, query)},
     ]
 

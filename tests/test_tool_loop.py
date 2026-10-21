@@ -16,6 +16,7 @@ from agent.environment import (
     Environment,
     GradingError,
 )
+from agent.harness import load_harness
 from agent.model import (
     API_URL,
     MAX_OUTPUT_TOKENS,
@@ -25,7 +26,7 @@ from agent.model import (
     ModelError,
 )
 from agent.server import AGENT_NAME, create_app
-from agent.tool_loop import MAX_MODEL_ACTIONS, submission_key
+from agent.tool_loop import MAX_MODEL_ACTIONS
 from agent.tools import (
     ALLOWED_TOOLS,
     ASK_USER_COST,
@@ -106,6 +107,11 @@ def model_reply(content: str, finish_reason: str = "stop") -> dict:
     }
 
 
+def model_events(state: dict) -> list[dict]:
+    return [event for event in state.get("adk_events", [])
+            if event.get("type") == "model_call"]
+
+
 class FakeClock:
     """A monotonic clock the tests move to check the session deadline."""
 
@@ -114,81 +120,6 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.value
-
-
-class SubmissionKeyTests(unittest.TestCase):
-    """R-1: the duplicate key keeps SQL that means something different apart."""
-
-    def test_whitespace_between_tokens_is_normalized(self):
-        self.assertEqual(submission_key("  SELECT 1; \n"), "SELECT 1;")
-        self.assertEqual(
-            submission_key("SELECT   a,\n\t b  FROM t;"), submission_key("SELECT a, b FROM t;")
-        )
-
-    def test_string_literal_and_quoted_identifier_content_is_preserved(self):
-        self.assertNotEqual(submission_key("SELECT 'a  b';"), submission_key("SELECT 'a b';"))
-        self.assertNotEqual(
-            submission_key("SELECT 'it''s  ok';"), submission_key("SELECT 'it''s ok';")
-        )
-        self.assertNotEqual(
-            submission_key('SELECT "a  b" FROM t;'), submission_key('SELECT "a b" FROM t;')
-        )
-        self.assertEqual(
-            submission_key("SELECT  'a  b'   AS x;"), submission_key("SELECT 'a  b' AS x;")
-        )
-
-    def test_adjacent_string_constants_keep_their_separating_whitespace(self):
-        # 'a' 'b' is a syntax error, while 'a'\n'b' concatenates to 'ab'.
-        self.assertEqual(submission_key("SELECT 'a'\n'b';"), "SELECT 'a'\n'b';")
-        self.assertNotEqual(submission_key("SELECT 'a'\n'b';"), submission_key("SELECT 'a' 'b';"))
-        self.assertNotEqual(submission_key("SELECT 'a'\n'b';"), submission_key("SELECT 'a'  'b';"))
-        self.assertNotEqual(
-            submission_key("SELECT 'a'\nE'b';"), submission_key("SELECT 'a' E'b';")
-        )
-        self.assertEqual(
-            submission_key("SELECT  'a'\n'b'  ;"), submission_key("SELECT 'a'\n'b' ;")
-        )
-
-    def test_comment_text_and_line_breaks_are_preserved(self):
-        self.assertNotEqual(
-            submission_key("SELECT 1; -- a\nb"), submission_key("SELECT 1; -- a b")
-        )
-        self.assertEqual(
-            submission_key("SELECT 1; -- a\nSELECT 2;"), submission_key("SELECT 1;   -- a\nSELECT 2;")
-        )
-        self.assertNotEqual(
-            submission_key("SELECT /* a  b */ 1;"), submission_key("SELECT /* a b */ 1;")
-        )
-        self.assertEqual(
-            submission_key("SELECT   /* a b */   1;"), submission_key("SELECT /* a b */ 1;")
-        )
-        self.assertNotEqual(
-            submission_key("SELECT /* a\nb */ 1;"), submission_key("SELECT /* a b */ 1;")
-        )
-
-    def test_dollar_quoted_bodies_are_preserved(self):
-        self.assertNotEqual(submission_key("SELECT $$a  b$$;"), submission_key("SELECT $$a b$$;"))
-        self.assertNotEqual(
-            submission_key("SELECT $tag$a  b$tag$;"), submission_key("SELECT $tag$a b$tag$;")
-        )
-        self.assertNotEqual(
-            submission_key("SELECT $한$a  b$한$;"), submission_key("SELECT $한$a b$한$;")
-        )
-        self.assertEqual(
-            submission_key("SELECT 1 WHERE x = $1;"), "SELECT 1 WHERE x = $1;"
-        )
-        self.assertEqual(
-            submission_key("SELECT  1  WHERE  x = $1;"), submission_key("SELECT 1 WHERE x = $1;")
-        )
-
-    def test_ambiguous_escaping_or_unbalanced_text_falls_back_to_exact_matching(self):
-        escaped = "SELECT E'a\\'b';"
-        self.assertEqual(submission_key(escaped), escaped)
-        self.assertNotEqual(submission_key(f"SELECT  {escaped}"), submission_key(escaped))
-        for text in ("SELECT 'unterminated", 'SELECT "unterminated', "SELECT /* unterminated"):
-            with self.subTest(text=text):
-                self.assertEqual(submission_key(text), text)
-        self.assertEqual(submission_key("SELECT /* a /* b */ c */ 1;"), "SELECT /* a /* b */ c */ 1;")
 
 
 class ActionParsingTests(unittest.TestCase):
@@ -617,6 +548,7 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertEqual(health["mode"], "tools")
         self.assertEqual(health["model"], MODEL_ID)
         self.assertEqual(health["tools"], tool_metadata())
+        self.assertEqual(health["harness"], load_harness().descriptor())
         self.assertEqual(health["execute_sql_timeout_seconds"], EXECUTE_SQL_TIMEOUT_SECONDS)
         self.assertEqual(health["ask_user_timeout_seconds"], ASK_USER_TIMEOUT_SECONDS)
 
@@ -624,6 +556,17 @@ class ToolLoopContractTests(ToolLoopTestCase):
             self.assertEqual(TestClient(create_app()).get("/health").json()["mode"], "tools")
         with mock.patch.dict(os.environ, {"AGENT_MODE": ""}):
             self.assertEqual(TestClient(create_app()).get("/health").json()["mode"], "tools")
+
+    def test_the_harness_is_recorded_in_every_session(self):
+        self.actions = [action("submit_sql", sql="SELECT 1;")]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        descriptor = load_harness().descriptor()
+        self.assertEqual(state["harness"], descriptor)
+        # The runner copies adk_events into the result JSON, so each model
+        # call carries the same identity without changing the event order.
+        self.assertEqual(model_events(state)[0]["harness"], descriptor)
 
     def test_removed_modes_are_rejected_instead_of_silently_running_tools(self):
         for removed in ("fixed", "unknown"):
@@ -726,15 +669,12 @@ class ToolLoopContractTests(ToolLoopTestCase):
         ask_feedback = self.model_requests[8]["messages"][-1]["content"]
         self.assertIn(USER_ANSWER, ask_feedback)
         self.assertIn("[action 8 | phase 1 | ask_user | cost 2 | budget 10.5]", ask_feedback)
-        self.assertEqual(
-            state["adk_events"][-1]["prompt"], self.model_requests[-1]["messages"]
-        )
-        self.assertEqual([e["call_index"] for e in state["adk_events"]], list(range(1, 10)))
-        self.assertEqual(
-            [e["action"]["name"] for e in state["adk_events"]], list(TOOL_COSTS)
-        )
-        self.assertEqual(state["adk_events"][0]["settings"]["endpoint"], API_URL)
-        self.assertEqual(state["adk_events"][0]["usage"]["total_tokens"], 14)
+        events = model_events(state)
+        self.assertEqual(events[-1]["prompt"], self.model_requests[-1]["messages"])
+        self.assertEqual([e["call_index"] for e in events], list(range(1, 10)))
+        self.assertEqual([e["action"]["name"] for e in events], list(TOOL_COSTS))
+        self.assertEqual(events[0]["settings"]["endpoint"], API_URL)
+        self.assertEqual(events[0]["usage"]["total_tokens"], 14)
         self.assertNotIn("test-key", json.dumps(state))
 
     def test_invalid_new_tool_arguments_cost_nothing_and_call_nothing(self):
@@ -753,7 +693,7 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertEqual(state["dialogue_history"], [])
         for index in range(3):
             with self.subTest(index=index):
-                event = state["adk_events"][index]
+                event = model_events(state)[index]
                 self.assertIsNone(event["action"])
                 self.assertTrue(event["action_error"])
                 observation = self.model_requests[index + 1]["messages"][-1]["content"]
@@ -791,114 +731,88 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertIn("Phase 1 correct!", phase2_prompt)
         self.assertIn("And by region?", phase2_prompt)
         self.assertIn("applied to the database", phase2_prompt)
-        self.assertEqual([e["phase"] for e in state["adk_events"]], [1, 1, 2])
-        self.assertEqual(state["adk_events"][1]["action"]["args"]["sql"],
+        self.assertEqual([e["phase"] for e in model_events(state)], [1, 1, 2])
+        self.assertEqual(model_events(state)[1]["action"]["args"]["sql"],
                          "SELECT count(id) FROM customers;")
 
-    def test_duplicate_key_keeps_meaningful_sql_changes_submittable(self):
-        cases = {
-            "different string literal": (
-                "SELECT count(*) FROM customers WHERE name = 'a  b';",
-                "SELECT count(*) FROM customers WHERE name = 'a b';",
-            ),
-            "different line comment": (
-                "SELECT count(*) FROM customers; -- first  note",
-                "SELECT count(*) FROM customers; -- first note",
-            ),
-            "syntax error fixed with a newline between adjacent strings": (
-                "SELECT count(*) FROM customers WHERE name = 'a' 'b';",
-                "SELECT count(*) FROM customers WHERE name = 'a'\n'b';",
-            ),
-            "different unicode dollar-quoted body": (
-                "SELECT count(*) FROM customers WHERE name = $한$a  b$한$;",
-                "SELECT count(*) FROM customers WHERE name = $한$a b$한$;",
-            ),
-        }
-        for name, (first, revised) in cases.items():
-            with self.subTest(name=name):
-                self.setUp()
-                final = "SELECT count(*) FROM customers;"
-                self.actions = [
-                    action("submit_sql", sql=first),
-                    action("submit_sql", sql=revised),
-                    action("submit_sql", sql=revised),
-                    action("submit_sql", sql=final),
-                ]
-                self.grader_payloads = [
-                    dict(GRADER_FAILURE), dict(GRADER_FAILURE), dict(PHASE1_FINAL),
-                ]
-                state = self.run_ok()
-
-                self.assertEqual(
-                    [payload["sql"] for path, payload in self.service_requests if path == "/submit"],
-                    [first, revised, final],
-                )
-                self.assertEqual(state["total_reward"], 0.7)
-                self.assertTrue(state["task_done"])
-                self.assertEqual(state["stop_reason"], "phase1_completed")
-                self.assertEqual(
-                    [(entry["tool"], entry["cost"]) for entry in state["tool_trajectory"]],
-                    [("submit_sql", 3.0), ("submit_sql", 3.0), ("submit_sql", 0.0),
-                     ("submit_sql", 3.0)],
-                )
-                self.assertEqual(state["tool_trajectory"][2]["blocked"], "duplicate_sql")
-                self.assertEqual(state["submit_attempts"], [
-                    {"phase": 1, "sql": first},
-                    {"phase": 1, "sql": revised},
-                    {"phase": 1, "sql": final},
-                ])
-
-    def test_duplicate_sql_is_blocked_per_phase_without_a_charge(self):
-        first = "SELECT 1;"
-        second = "SELECT 2;"
+    def test_same_sql_is_submitted_and_charged_every_time(self):
+        first = "SELECT count(*) FROM customers;"
+        second = "SELECT count(id) FROM customers;"
         self.actions = [
             action("submit_sql", sql=first),
             action("submit_sql", sql=f"  {first}  "),
             action("submit_sql", sql=second),
-            action("submit_sql", sql=first),
         ]
         self.grader_payloads = [
-            dict(GRADER_FAILURE), dict(PHASE1_WITH_FOLLOW_UP), dict(PHASE2_PASS),
+            dict(GRADER_FAILURE), dict(GRADER_FAILURE), dict(PHASE1_FINAL),
         ]
         state = self.run_ok()
 
-        self.assertEqual([payload["sql"] for _, payload in self.service_requests
-                          if _ == "/submit"], [first, second, first])
         self.assertEqual(
-            [entry["phase"] for entry in state["tool_trajectory"]], [1, 1, 1, 2]
+            [payload["sql"] for path, payload in self.service_requests if path == "/submit"],
+            [first, first, second],
         )
-        blocked = state["tool_trajectory"][1]
-        self.assertEqual(blocked["tool"], "submit_sql")
-        self.assertEqual(blocked["cost"], 0.0)
-        self.assertEqual(blocked["blocked"], "duplicate_sql")
-        self.assertEqual(blocked["budget_before"], blocked["budget_after"])
+        self.assertEqual(state["total_reward"], 0.7)
+        self.assertTrue(state["task_done"])
+        self.assertEqual(state["stop_reason"], "phase1_completed")
         self.assertEqual(
-            [entry["budget_after"] for entry in state["tool_trajectory"]], [15, 15, 12, 9]
+            self.trajectory(state),
+            [("submit_sql", 3.0), ("submit_sql", 3.0), ("submit_sql", 3.0)],
         )
         self.assertEqual(
-            state["submit_attempts"],
-            [{"phase": 1, "sql": first}, {"phase": 1, "sql": second}, {"phase": 2, "sql": first}],
+            [entry["budget_after"] for entry in state["tool_trajectory"]], [15, 12, 9]
         )
-        feedback = self.model_requests[2]["messages"][-1]["content"]
-        self.assertIn("already submitted in phase 1", feedback)
-        self.assertIn("| cost 0 |", feedback)
+        for entry in state["tool_trajectory"]:
+            self.assertNotIn("blocked", entry)
+            self.assertNotIn("duplicate_sql", entry)
+        self.assertEqual(state["submit_attempts"], [
+            {"phase": 1, "sql": first},
+            {"phase": 1, "sql": first},
+            {"phase": 1, "sql": second},
+        ])
 
-    def test_repeated_information_lookup_is_cached_and_still_charged(self):
+    def test_the_same_sql_is_submitted_again_in_phase_two(self):
+        sql = "SELECT 1;"
+        self.actions = [
+            action("submit_sql", sql=sql),
+            action("submit_sql", sql=sql),
+        ]
+        self.grader_payloads = [dict(PHASE1_WITH_FOLLOW_UP), dict(PHASE2_PASS)]
+        state = self.run_ok()
+
+        self.assertEqual(
+            [payload["sql"] for path, payload in self.service_requests if path == "/submit"],
+            [sql, sql],
+        )
+        self.assertEqual(state["total_reward"], 1.0)
+        self.assertEqual(state["stop_reason"], "phase2_completed")
+        self.assertEqual(
+            [entry["phase"] for entry in state["tool_trajectory"]], [1, 2]
+        )
+        self.assertEqual(
+            [entry["cost"] for entry in state["tool_trajectory"]], [3.0, 3.0]
+        )
+        self.assertEqual(state["budget_remaining"], 12)
+        self.assertNotIn("blocked", state["tool_trajectory"][1])
+        feedback = self.model_requests[1]["messages"][-1]["content"]
+        self.assertNotIn("already submitted", feedback)
+
+    def test_repeated_information_lookup_is_sent_and_charged_again(self):
         self.actions = [action("get_schema"), action("get_schema"),
                         action("submit_sql", sql="SELECT 1;")]
         self.grader_payload = dict(PHASE1_FINAL)
         state = self.run_ok()
 
-        self.assertEqual(self.paths(), ["/schema", "/submit"])
+        self.assertEqual(self.paths(), ["/schema", "/schema", "/submit"])
         self.assertEqual(
             self.trajectory(state), [("get_schema", 1.0), ("get_schema", 1.0), ("submit_sql", 3.0)]
         )
-        cached = state["tool_trajectory"][1]
-        self.assertEqual(cached["cached"], True)
-        self.assertEqual(cached["result"], {"cache_hit": True})
+        repeated = state["tool_trajectory"][1]
+        self.assertNotIn("cached", repeated)
+        self.assertEqual(repeated["result"], SCHEMA_TEXT)
         self.assertEqual(state["budget_remaining"], 13)
         feedback = self.model_requests[2]["messages"][-1]["content"]
-        self.assertIn("Served from the session cache", feedback)
+        self.assertNotIn("Served from the session cache", feedback)
         self.assertIn(SCHEMA_TEXT, feedback)
 
     def test_unusable_model_responses_are_fed_back_without_charging(self):
@@ -921,7 +835,7 @@ class ToolLoopContractTests(ToolLoopTestCase):
                 self.assertEqual(self.paths(), ["/submit"])
                 self.assertEqual(self.trajectory(state), [("submit_sql", 3.0)])
                 self.assertEqual(state["budget_remaining"], 15)
-                event = state["adk_events"][0]
+                event = model_events(state)[0]
                 self.assertIsNone(event["action"])
                 self.assertTrue(event["action_error"])
                 if name == "truncated":
@@ -972,7 +886,7 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.actions = [action("get_schema")] * MAX_MODEL_ACTIONS
         state = self.run_ok()
         self.assertEqual(len(self.model_requests), MAX_MODEL_ACTIONS)
-        self.assertEqual(self.paths(), ["/schema"])
+        self.assertEqual(self.paths(), ["/schema"] * MAX_MODEL_ACTIONS)
         self.assertEqual(state["budget_remaining"], 60 - MAX_MODEL_ACTIONS)
         self.assertEqual(state["stop_reason"], "action_limit_reached")
         self.assertIn(str(MAX_MODEL_ACTIONS), state["final_response"])
@@ -1004,8 +918,8 @@ class ToolLoopContractTests(ToolLoopTestCase):
         self.assertIn("was reached after the model response", state["final_response"])
         self.assertFalse(state["task_done"])
         self.assertFalse(state["phase1_completed"])
-        self.assertEqual(len(state["adk_events"]), 1)
-        self.assertNotIn("action", state["adk_events"][0])
+        self.assertEqual(len(model_events(state)), 1)
+        self.assertNotIn("action", model_events(state)[0])
         self.assertEqual(state["session_elapsed_seconds"], 1501.0)
 
     def test_state_beyond_the_allowed_inputs_never_reaches_the_model(self):
@@ -1182,7 +1096,7 @@ class MultipleActionAndStatementTests(ToolLoopTestCase):
         self.assertEqual(self.paths(), ["/schema", "/submit"])
         self.assertEqual(self.trajectory(state), [("get_schema", 1.0), ("submit_sql", 3.0)])
         self.assertEqual(state["budget_remaining"], 14)
-        event = state["adk_events"][0]
+        event = model_events(state)[0]
         self.assertEqual(event["action"]["name"], "get_schema")
         self.assertEqual(event["action_count"], 2)
         self.assertEqual(event["ignored_actions"], 1)
@@ -1200,7 +1114,7 @@ class MultipleActionAndStatementTests(ToolLoopTestCase):
         state = self.run_ok()
 
         self.assertEqual(self.paths(), ["/schema", "/submit"])
-        event = state["adk_events"][0]
+        event = model_events(state)[0]
         self.assertEqual(event["action_count"], 2)
         self.assertNotIn("ignored_actions", event)
         feedback = self.model_requests[1]["messages"][-1]["content"]
@@ -1215,7 +1129,7 @@ class MultipleActionAndStatementTests(ToolLoopTestCase):
         state = self.run_ok()
 
         self.assertEqual(self.paths(), ["/schema", "/submit"])
-        self.assertEqual(state["adk_events"][0]["action"]["name"], "get_schema")
+        self.assertEqual(model_events(state)[0]["action"]["name"], "get_schema")
         self.assertEqual(state["budget_remaining"], 14)
 
     def test_multiple_statement_execute_sql_is_rejected_without_a_service_call(self):
@@ -1230,7 +1144,7 @@ class MultipleActionAndStatementTests(ToolLoopTestCase):
         self.assertEqual(self.trajectory(state), [("submit_sql", 3.0)])
         self.assertEqual(state["budget_remaining"], 15)
         self.assertEqual(state["tool_trajectory"][0]["budget_before"], 18)
-        event = state["adk_events"][0]
+        event = model_events(state)[0]
         self.assertIsNone(event["action"])
         self.assertIn("2 statements", event["action_error"])
         rejected = self.model_requests[1]["messages"][-1]["content"]
@@ -1269,13 +1183,14 @@ class AssistantHistoryTests(ToolLoopTestCase):
                       observation["content"])
         self.assertIn("contained 2 actions", observation["content"])
 
-        self.assertEqual(state["adk_events"][0]["content"], fabricated)
-        self.assertEqual(state["adk_events"][0]["action"], {"name": "get_schema", "args": {}})
-        self.assertEqual(state["adk_events"][0]["action_count"], 2)
-        self.assertEqual(state["adk_events"][0]["ignored_actions"], 1)
-        self.assertEqual(state["adk_events"][1]["prompt"], self.model_requests[1]["messages"])
+        events = model_events(state)
+        self.assertEqual(events[0]["content"], fabricated)
+        self.assertEqual(events[0]["action"], {"name": "get_schema", "args": {}})
+        self.assertEqual(events[0]["action_count"], 2)
+        self.assertEqual(events[0]["ignored_actions"], 1)
+        self.assertEqual(events[1]["prompt"], self.model_requests[1]["messages"])
         self.assertEqual(
-            [event["action"]["name"] for event in state["adk_events"]],
+            [event["action"]["name"] for event in events],
             ["get_schema", "submit_sql"],
         )
         self.assertEqual(state["budget_remaining"], 14)
@@ -1307,7 +1222,7 @@ class AssistantHistoryTests(ToolLoopTestCase):
                 self.assertEqual(self.assistant_messages(self.model_requests[1]), [
                     {"role": "assistant", "content": self.canonical(name, args)},
                 ])
-                self.assertEqual(state["adk_events"][0]["action"], {"name": name, "args": args})
+                self.assertEqual(model_events(state)[0]["action"], {"name": name, "args": args})
 
     def test_rejected_responses_stay_in_the_history_verbatim(self):
         cases = {
@@ -1330,9 +1245,9 @@ class AssistantHistoryTests(ToolLoopTestCase):
                 self.assertEqual(self.assistant_messages(self.model_requests[1]), [
                     {"role": "assistant", "content": content},
                 ])
-                self.assertEqual(state["adk_events"][0]["content"], content)
-                self.assertIsNone(state["adk_events"][0]["action"])
-                self.assertTrue(state["adk_events"][0]["action_error"])
+                self.assertEqual(model_events(state)[0]["content"], content)
+                self.assertIsNone(model_events(state)[0]["action"])
+                self.assertTrue(model_events(state)[0]["action_error"])
 
     def test_retries_and_phase_two_keep_the_standard_json_in_the_history(self):
         first, second, third = "SELECT 0;", "SELECT 1;", "SELECT 2;"
@@ -1360,7 +1275,7 @@ class AssistantHistoryTests(ToolLoopTestCase):
                     {"role": "assistant", "content": self.canonical(name, args)},
                 )
         self.assertEqual(
-            [event["phase"] for event in state["adk_events"]], [1, 1, 2, 2]
+            [event["phase"] for event in model_events(state)], [1, 1, 2, 2]
         )
         self.assertEqual(state["budget_remaining"], 8)
 
@@ -1372,6 +1287,7 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         self.actions = []
         self.service_requests = []
         self.model_requests = []
+        self.harness = load_harness()
 
     def client(self, service_status: dict | None = None, model_status: int = 200) -> ModelClient:
         def handler(request):
@@ -1426,13 +1342,16 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         self.actions = [action("get_schema")]
         state = self.state()
         with self.assertRaises(ModelError) as caught:
-            await tool_loop.run(state, "Answer.", self.environment(), self.client(model_status=500))
+            await tool_loop.run(
+                state, "Answer.", self.environment(), self.client(model_status=500),
+                harness=self.harness,
+            )
         self.assertEqual(state["failure"]["stage"], "model")
         self.assertEqual(state["budget_remaining"], 18)
         self.assertEqual(len(self.model_requests), MAX_RETRIES + 1)
         self.assertIn(f"after {MAX_RETRIES + 1} attempts", str(caught.exception))
         self.assertEqual(self.service_requests, [])
-        self.assertEqual(state["adk_events"], [])
+        self.assertEqual(model_events(state), [])
         self.assertNotIn("loop_stopped", state)
 
     async def test_information_contract_failure_stops_the_run(self):
@@ -1440,7 +1359,9 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         state = self.state()
         environment = Environment(httpx.MockTransport(self._broken_schema_handler))
         with self.assertRaises(GradingError):
-            await tool_loop.run(state, "Answer.", environment, self.client())
+            await tool_loop.run(
+                state, "Answer.", environment, self.client(), harness=self.harness
+            )
         self.assertEqual(state["failure"]["stage"], "information")
         self.assertEqual(state["budget_remaining"], 17)
         self.assertEqual(
@@ -1458,7 +1379,8 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         state = self.state()
         with self.assertRaises(GradingError):
             await tool_loop.run(
-                state, "Answer.", self.environment({"/submit": 500}), self.client()
+                state, "Answer.", self.environment({"/submit": 500}), self.client(),
+                harness=self.harness,
             )
         self.assertEqual(state["failure"]["stage"], "grader")
         self.assertEqual(state["budget_remaining"], 15)
@@ -1474,6 +1396,7 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
                 state, "Answer.",
                 self.environment({"/phase_transition": 500}, PHASE1_WITH_FOLLOW_UP),
                 self.client(),
+                harness=self.harness,
             )
         self.assertEqual(state["failure"]["stage"], "transition")
         self.assertEqual(state["total_reward"], 0.7)
@@ -1487,7 +1410,9 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         environment = self.environment({"/submit": 500})
         for _ in range(2):
             with self.assertRaises(GradingError):
-                await tool_loop.run(state, "Answer.", environment, self.client())
+                await tool_loop.run(
+                    state, "Answer.", environment, self.client(), harness=self.harness
+                )
         self.assertEqual(len(self.model_requests), 1)
         self.assertEqual([path for path, _ in self.service_requests], ["/submit"])
 
@@ -1496,7 +1421,9 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         state = self.state()
         environment = self.environment({"/execute": 500})
         with self.assertRaises(GradingError) as caught:
-            await tool_loop.run(state, "Answer.", environment, self.client())
+            await tool_loop.run(
+                state, "Answer.", environment, self.client(), harness=self.harness
+            )
         self.assertIn("SQL execution", str(caught.exception))
         self.assertEqual(state["failure"]["stage"], "execute_sql")
         self.assertEqual(state["budget_remaining"], 17)
@@ -1509,7 +1436,9 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("submit_attempts", state)
         # The failed attempt stays cached inside the session; it is never retried.
         with self.assertRaises(GradingError):
-            await tool_loop.run(state, "Answer.", environment, self.client())
+            await tool_loop.run(
+                state, "Answer.", environment, self.client(), harness=self.harness
+            )
         self.assertEqual([path for path, _ in self.service_requests], ["/execute"])
 
     async def test_ask_user_http_failure_never_invents_an_answer(self):
@@ -1518,7 +1447,10 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
         ]
         state = self.state()
         with self.assertRaises(GradingError):
-            await tool_loop.run(state, "Answer.", self.environment({"/ask": 500}), self.client())
+            await tool_loop.run(
+                state, "Answer.", self.environment({"/ask": 500}), self.client(),
+                harness=self.harness,
+            )
         self.assertEqual(state["failure"]["stage"], "ask_user")
         self.assertEqual(state.get("dialogue_history", []), [])
         self.assertEqual(state["budget_remaining"], 16)
@@ -1541,7 +1473,8 @@ class ToolLoopFailureTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(GradingError) as caught:
             await tool_loop.run(
-                state, "Answer.", Environment(httpx.MockTransport(handler)), self.client()
+                state, "Answer.", Environment(httpx.MockTransport(handler)), self.client(),
+                harness=self.harness,
             )
         self.assertIn("non-empty answer", str(caught.exception))
         self.assertEqual(state["failure"]["stage"], "ask_user")

@@ -283,8 +283,6 @@ class _LangfuseToolSpan(ToolSpan):
         if entry.get("tool") == "submit_sql" and isinstance(result, dict):
             if "passed" not in result:
                 return "ERROR", result.get("error")
-        if entry.get("blocked"):
-            return "WARNING", f"blocked: {entry['blocked']}"
         return "DEFAULT", None
 
     def finish(self, entry: dict, **extra: Any) -> None:
@@ -294,8 +292,6 @@ class _LangfuseToolSpan(ToolSpan):
             "cost": entry.get("cost", self._cost),
             "budget_before": entry.get("budget_before", self._budget_before),
             "budget_after": entry.get("budget_after"),
-            "cached": entry.get("cached", False),
-            "blocked": entry.get("blocked"),
             "timed_out": entry.get("timed_out", False),
             "elapsed_seconds": entry.get("elapsed_seconds"),
         }
@@ -348,6 +344,8 @@ class _LangfuseSessionTrace(SessionTrace):
         code_version: str | None,
         agent_name: str,
         model_id: str,
+        harness_name: str = "",
+        harness_sha256: str = "",
     ):
         self._failed = False
         self._ended = False
@@ -364,6 +362,10 @@ class _LangfuseSessionTrace(SessionTrace):
         }
         if code_version:
             metadata["code_version"] = code_version
+        if harness_name:
+            metadata["harness_name"] = harness_name
+        if harness_sha256:
+            metadata["harness_sha256"] = harness_sha256
 
         self._propagation = propagate(session_id=eval_run_id, trace_name=name)
         self._propagation.__enter__()
@@ -512,6 +514,8 @@ class LangfuseTracer(Tracer):
         code_version: str | None,
         agent_name: str,
         model_id: str,
+        harness_name: str = "",
+        harness_sha256: str = "",
     ):
         self._client = client
         self._propagate = propagate
@@ -519,6 +523,8 @@ class LangfuseTracer(Tracer):
         self._code_version = code_version
         self._agent_name = agent_name
         self._model_id = model_id
+        self._harness_name = harness_name
+        self._harness_sha256 = harness_sha256
 
     def start_session(self, *, task_id: str, input: str) -> SessionTrace:
         try:
@@ -531,6 +537,8 @@ class LangfuseTracer(Tracer):
                 code_version=self._code_version,
                 agent_name=self._agent_name,
                 model_id=self._model_id,
+                harness_name=self._harness_name,
+                harness_sha256=self._harness_sha256,
             )
         except Exception as exc:
             _warn_once(f"Langfuse tracing was disabled ({type(exc).__name__})")
@@ -570,7 +578,13 @@ def _load_tracer_provider():
     return TracerProvider()
 
 
-def create_tracer(*, agent_name: str, model_id: str) -> Tracer:
+def create_tracer(
+    *,
+    agent_name: str,
+    model_id: str,
+    harness_name: str = "",
+    harness_sha256: str = "",
+) -> Tracer:
     public_key = _env(PUBLIC_KEY_ENV)
     secret_key = _env(SECRET_KEY_ENV)
     if not public_key or not secret_key:
@@ -593,4 +607,6 @@ def create_tracer(*, agent_name: str, model_id: str) -> Tracer:
         code_version=_env(CODE_VERSION_ENV) or None,
         agent_name=agent_name,
         model_id=model_id,
+        harness_name=harness_name,
+        harness_sha256=harness_sha256,
     )

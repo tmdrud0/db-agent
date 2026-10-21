@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.environment import Environment, GradingError
+from agent.harness import Harness, load_harness
 from agent.model import MODEL_ID, ModelClient, ModelError
 from agent.session import InputError
 from agent.tool_loop import run as run_tool_loop
@@ -53,6 +54,7 @@ def create_app(
     model: ModelClient | None = None,
     mode: str | None = None,
     tracer: Tracer | None = None,
+    harness: Harness | None = None,
 ) -> FastAPI:
     # The tool-selecting loop is the only agent. An explicit request for a
     # removed mode must fail instead of silently running a different agent.
@@ -64,6 +66,9 @@ def create_app(
         )
     environment = environment or Environment()
     model = model or ModelClient()
+    # The harness is read once when the server is created. Changes to its files
+    # do not affect a running server.
+    harness = harness if harness is not None else load_harness()
     # The real client is created by the lifespan startup, not here: a test
     # app built without a lifespan must never reach Langfuse just because the
     # shell inherited keys from a previous evaluation run.
@@ -75,7 +80,12 @@ def create_app(
     async def lifespan(_app: FastAPI):
         nonlocal live_tracer
         if live_tracer is None:
-            live_tracer = create_tracer(agent_name=AGENT_NAME, model_id=MODEL_ID)
+            live_tracer = create_tracer(
+                agent_name=AGENT_NAME,
+                model_id=MODEL_ID,
+                harness_name=harness.name,
+                harness_sha256=harness.sha256,
+            )
         try:
             yield
         finally:
@@ -102,6 +112,7 @@ def create_app(
             # The real tool set identifies the service, so a stale server that
             # only shares the name cannot be reused by the evaluator.
             "tools": tool_metadata(),
+            "harness": harness.descriptor(),
             "execute_sql_timeout_seconds": environment.execute_sql_timeout,
             "ask_user_timeout_seconds": environment.ask_user_timeout,
         }
@@ -120,6 +131,7 @@ def create_app(
                 "phase1_completed": False, "phase2_completed": False,
                 "task_done": False, "tool_trajectory": [],
                 "dialogue_history": [], "adk_events": [],
+                "harness": harness.descriptor(),
             }.items():
                 state.setdefault(name, default)
             sessions[key] = Session(state)
@@ -134,7 +146,8 @@ def create_app(
         async with session.lock:
             try:
                 response = await run_tool_loop(
-                    session.state, req.message, environment, model, active_tracer
+                    session.state, req.message, environment, model, active_tracer,
+                    harness=harness,
                 )
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc

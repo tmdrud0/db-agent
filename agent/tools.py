@@ -151,12 +151,22 @@ ALLOWED_TOOLS = {
 TOOL_COSTS = {name: spec.cost for name, spec in ALLOWED_TOOLS.items()}
 
 
-def catalog() -> str:
-    """The tool list shown to the model, one action per line."""
-    return "\n".join(
-        f"- {spec.name}: {spec.summary}. arguments: {spec.arguments}. Cost: {spec.cost:g}"
-        for spec in ALLOWED_TOOLS.values()
-    )
+def catalog(notes: dict[str, str] | None = None) -> str:
+    """The tool list shown to the model, one action per line.
+
+    Harness-provided guidance for a tool is appended under its line; without a
+    note the catalog is unchanged.
+    """
+    lines = []
+    for spec in ALLOWED_TOOLS.values():
+        lines.append(
+            f"- {spec.name}: {spec.summary}. arguments: {spec.arguments}. Cost: {spec.cost:g}"
+        )
+        note = (notes or {}).get(spec.name, "").strip()
+        if note:
+            lines.append("  Usage note:")
+            lines.extend(f"  {line}" for line in note.splitlines())
+    return "\n".join(lines)
 
 
 def tool_metadata() -> list[dict]:
@@ -205,89 +215,6 @@ def _block_comment_end(text: str, start: int) -> int | None:
         else:
             index += 1
     return None
-
-
-def _starts_string_constant(text: str, index: int) -> bool:
-    """Whether a string constant token starts at index.
-
-    Erring towards yes only narrows the duplicate check, so prefixed forms are
-    included too.
-    """
-    if index >= len(text):
-        return False
-    char = text[index]
-    if char == "'":
-        return True
-    if char == "$":
-        return _dollar_span(text, index) is not None
-    if char in "eEbBxXnN":
-        return index + 1 < len(text) and text[index + 1] == "'"
-    return char in "uU" and index + 1 < len(text) and text[index + 1] == "&"
-
-
-def submission_key(sql: str) -> str:
-    """The duplicate key of one submission.
-
-    Whitespace between tokens is collapsed, but the text inside string literals,
-    quoted identifiers, dollar-quoted bodies and comments is preserved exactly:
-    SQL that differs only there means something different, and blocking it would
-    keep a corrected statement away from the official grader. The whitespace
-    between two adjacent string constants is kept as written as well, because a
-    newline there concatenates them while any other spacing is a syntax error;
-    collapsing it would hide the fix for that error. Regions whose extent cannot
-    be decided safely (escape strings, unbalanced quotes or comments) fall back
-    to the unchanged text, which only narrows the check.
-    """
-    text = sql.strip()
-    parts: list[str] = []
-    index = 0
-    after_string = False
-    while index < len(text):
-        char = text[index]
-        if char in SQL_WHITESPACE:
-            start = index
-            while index < len(text) and text[index] in SQL_WHITESPACE:
-                index += 1
-            if after_string and _starts_string_constant(text, index):
-                parts.append(text[start:index])
-            else:
-                parts.append(" ")
-            after_string = False
-            continue
-        if char in "'\"":
-            span = _quoted_span(text, index, char, allow_escapes=char == "'")
-            if span is None:
-                return text
-            parts.append(span[0])
-            index = span[1]
-            after_string = char == "'"
-            continue
-        if char == "$":
-            span = _dollar_span(text, index)
-            if span is not None:
-                parts.append(span[0])
-                index = span[1]
-                after_string = True
-                continue
-        elif text.startswith("--", index):
-            end = text.find("\n", index)
-            end = len(text) if end == -1 else end + 1
-            parts.append(text[index:end])
-            index = end
-            after_string = False
-            continue
-        elif text.startswith("/*", index):
-            end = _block_comment_end(text, index)
-            if end is None:
-                return text
-            parts.append(text[index:end])
-            index = end
-            after_string = False
-            continue
-        parts.append(char)
-        index += 1
-        after_string = False
-    return "".join(parts).strip()
 
 
 def statement_count(sql: str) -> int | None:
