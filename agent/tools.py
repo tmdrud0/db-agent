@@ -37,6 +37,21 @@ DSML_GUIDANCE = (
     '{"action": "...", "args": {...}}.'
 )
 
+# MiMo emits native tool calls as
+# <tool_call><function=execute_sql><parameter=sql>...</parameter></function></tool_call>
+# and may put the whole argument object in <parameter=args>{...}</parameter>.
+MIMO_CALL_OPEN = re.compile(r"<\s*tool_call\b[^>]*>", re.IGNORECASE)
+MIMO_CALL_CLOSE = re.compile(r"</\s*tool_call\s*>", re.IGNORECASE)
+MIMO_FUNCTION_OPEN = re.compile(r"<\s*function\s*=\s*([^\s<>/]+)\s*>", re.IGNORECASE)
+MIMO_FUNCTION_CLOSE = re.compile(r"</\s*function\s*>", re.IGNORECASE)
+MIMO_PARAMETER_OPEN = re.compile(r"<\s*parameter\s*=\s*([^\s<>/]+)\s*>", re.IGNORECASE)
+MIMO_PARAMETER_CLOSE = re.compile(r"</\s*parameter\s*>", re.IGNORECASE)
+
+MIMO_GUIDANCE = (
+    'The tool call could not be parsed. Reply with one JSON object like '
+    '{"action": "...", "args": {...}}.'
+)
+
 
 class ActionError(ValueError):
     """The model did not produce one allowed tool action."""
@@ -463,6 +478,71 @@ def _first_dsml_action(content: str, actions: list[_DsmlAction]) -> _DsmlAction:
     return actions[0]
 
 
+@dataclass(frozen=True)
+class _MimoAction:
+    name: str
+    args: dict
+    malformed: bool = False
+
+
+def _mimo_arguments(scope: str) -> tuple[dict, bool]:
+    """Read a MiMo function's arguments, preferring a JSON ``args`` parameter.
+
+    Like DSML, a call may wrap the whole argument object in ``parameter=args``
+    or name each argument directly, so named parameters are the fallback.
+    """
+    named: dict[str, str] = {}
+    args: str | None = None
+    for match in MIMO_PARAMETER_OPEN.finditer(scope):
+        close = MIMO_PARAMETER_CLOSE.search(scope, match.end())
+        if close is None:
+            return {}, True
+        body = scope[match.end():close.start()].strip()
+        parameter = match.group(1).strip()
+        if parameter == "args":
+            if args is None:
+                args = body
+        else:
+            named[parameter] = body
+    if args is not None:
+        try:
+            value = json.loads(args)
+        except ValueError:
+            return {}, True
+        if not isinstance(value, dict):
+            return {}, True
+        return value, False
+    return named, False
+
+
+def _mimo_actions(content: str) -> list[_MimoAction]:
+    opens = list(MIMO_CALL_OPEN.finditer(content))
+    actions = []
+    for position, match in enumerate(opens):
+        next_start = opens[position + 1].start() if position + 1 < len(opens) else None
+        close = MIMO_CALL_CLOSE.search(content, match.end())
+        if close is not None and (next_start is None or close.start() < next_start):
+            end = close.start()
+        else:
+            end = next_start if next_start is not None else len(content)
+        block = content[match.end():end]
+        function = MIMO_FUNCTION_OPEN.search(block)
+        if function is None:
+            actions.append(_MimoAction("", {}, malformed=True))
+            continue
+        function_close = MIMO_FUNCTION_CLOSE.search(block, function.end())
+        scope_end = function_close.start() if function_close is not None else len(block)
+        args, malformed = _mimo_arguments(block[function.end():scope_end])
+        actions.append(_MimoAction(function.group(1).strip(), args, malformed))
+    return actions
+
+
+def _first_mimo_action(actions: list[_MimoAction]) -> _MimoAction:
+    if not actions or actions[0].malformed:
+        raise ActionError(MIMO_GUIDANCE)
+    return actions[0]
+
+
 def parse_response(
     content: str, allowed: Mapping[str, ToolSpec] | None = None
 ) -> ParsedAction:
@@ -480,6 +560,7 @@ def parse_response(
         item for item in json_objects if isinstance(item.get("action"), str)
     ]
     dsml_actions = _dsml_actions(text)
+    mimo_actions = _mimo_actions(text)
     if json_actions:
         if json_objects[0] is not json_actions[0]:
             raise ActionError('The first JSON object needs an "action" member naming one tool.')
@@ -496,6 +577,7 @@ def parse_response(
         first_key = (name, _arguments(first))
         others = [(item["action"].strip(), _arguments(item)) for item in json_actions[1:]]
         others += [(item.name, item.args) for item in dsml_actions if not item.malformed]
+        others += [(item.name, item.args) for item in mimo_actions if not item.malformed]
     elif dsml_actions or DSML_INVOKE_ATTEMPT.search(text):
         first = _first_dsml_action(text, dsml_actions)
         name = first.name
@@ -510,6 +592,22 @@ def parse_response(
         first_key = (name, first.args)
         others = [
             (item.name, item.args) for item in dsml_actions[1:] if not item.malformed
+        ]
+        others += [(item.name, item.args) for item in mimo_actions if not item.malformed]
+    elif mimo_actions or MIMO_CALL_OPEN.search(text):
+        first = _first_mimo_action(mimo_actions)
+        name = first.name
+        if not name:
+            raise ActionError(MIMO_GUIDANCE)
+        spec = tools.get(name)
+        if spec is None:
+            raise ActionError(
+                f"Unknown action '{name}'. Available actions: {', '.join(tools)}."
+            )
+        args = validate_args(spec, first.args)
+        first_key = (name, first.args)
+        others = [
+            (item.name, item.args) for item in mimo_actions[1:] if not item.malformed
         ]
     else:
         raise ActionError(

@@ -101,6 +101,17 @@ def dsml_calls(*invokes: str) -> str:
     return "\n".join([f"{DSML} calls>", *invokes, f"{DSML_END} calls>"])
 
 
+def mimo_call(name: str, **parameters) -> str:
+    body = "".join(
+        f"<parameter={key}>{value}</parameter>" for key, value in parameters.items()
+    )
+    return f"<tool_call><function={name}>{body}</function></tool_call>"
+
+
+def mimo_calls(*calls: str) -> str:
+    return "\n".join(calls)
+
+
 def model_reply(content: str, finish_reason: str = "stop") -> dict:
     return {
         "model": MODEL_ID,
@@ -159,6 +170,12 @@ class ActionParsingTests(unittest.TestCase):
             ),
             "json and another dsml": (
                 f"{first}\n{dsml_calls(dsml_invoke('get_all_column_meanings'))}", 2, 1
+            ),
+            "json and the same mimo": (
+                f"{first}\n{mimo_call('get_schema')}", 2, 0
+            ),
+            "json and another mimo": (
+                f"{first}\n{mimo_call('get_all_column_meanings')}", 2, 1
             ),
         }
         for name, (content, action_count, ignored) in cases.items():
@@ -236,6 +253,90 @@ class ActionParsingTests(unittest.TestCase):
                 parse_action(content)
             self.assertIn('{"action"', str(caught.exception))
             self.assertIn("JSON", str(caught.exception))
+
+    def test_mimo_tool_calls_are_read_from_the_first_call(self):
+        cases = {
+            "named argument": (
+                mimo_call("execute_sql", sql="SELECT 1;"),
+                ("execute_sql", {"sql": "SELECT 1;"}),
+                1,
+                0,
+            ),
+            "json arguments": (
+                mimo_call("execute_sql", args='{"sql": "SELECT 1;"}'),
+                ("execute_sql", {"sql": "SELECT 1;"}),
+                1,
+                0,
+            ),
+            "no arguments": (
+                mimo_call("get_schema"),
+                ("get_schema", {}),
+                1,
+                0,
+            ),
+            "several named arguments": (
+                mimo_call("get_column_meaning", table_name="customers", column_name="id"),
+                ("get_column_meaning", {"table_name": "customers", "column_name": "id"}),
+                1,
+                0,
+            ),
+            "sql with comparison operators": (
+                mimo_call("execute_sql", sql="SELECT 1 WHERE 1 < 2 AND 3 > 2;"),
+                ("execute_sql", {"sql": "SELECT 1 WHERE 1 < 2 AND 3 > 2;"}),
+                1,
+                0,
+            ),
+            "multiple calls": (
+                mimo_calls(
+                    mimo_call("get_schema"), mimo_call("get_all_column_meanings")
+                ),
+                ("get_schema", {}),
+                2,
+                1,
+            ),
+            "same call twice": (
+                mimo_calls(mimo_call("get_schema"), mimo_call("get_schema")),
+                ("get_schema", {}),
+                2,
+                0,
+            ),
+            "newlines and spaces": (
+                "<tool_call>\n<function=execute_sql>\n"
+                "<parameter=sql>SELECT 1;</parameter>\n"
+                "</function>\n</tool_call>",
+                ("execute_sql", {"sql": "SELECT 1;"}),
+                1,
+                0,
+            ),
+        }
+        for name, (content, expected, action_count, ignored) in cases.items():
+            with self.subTest(name=name):
+                parsed = parse_response(content)
+                self.assertEqual((parsed.name, parsed.args), expected)
+                self.assertEqual(
+                    (parsed.action_count, parsed.ignored_actions), (action_count, ignored)
+                )
+                self.assertEqual(parse_action(content), expected)
+
+    def test_malformed_mimo_responses_are_rejected(self):
+        cases = {
+            "no function": "<tool_call></tool_call>",
+            "invalid json arguments": mimo_call("execute_sql", args='{"sql": '),
+            "arguments are not an object": mimo_call("execute_sql", args="[1]"),
+            "unclosed parameter": (
+                "<tool_call><function=execute_sql><parameter=sql>SELECT 1;"
+                "</function></tool_call>"
+            ),
+            "unknown action": mimo_call("drop_table"),
+            "missing sql": mimo_call("execute_sql"),
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name), self.assertRaises(ActionError):
+                parse_action(content)
+        with self.assertRaises(ActionError) as caught:
+            parse_action("<tool_call></tool_call>")
+        self.assertIn('{"action"', str(caught.exception))
+        self.assertIn("JSON", str(caught.exception))
 
     def test_an_invalid_first_action_is_not_replaced_by_a_later_valid_one(self):
         cases = {
