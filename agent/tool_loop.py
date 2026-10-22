@@ -261,7 +261,7 @@ async def _model_call(
         "harness": state.get("harness"),
         "call_index": 1 + _model_actions(state),
         "phase": phase,
-        "request_model": MODEL_ID,
+        "request_model": getattr(model, "model_id", MODEL_ID),
         "response_model": reply.response_model,
         "content": reply.content,
         "truncated": reply.truncated,

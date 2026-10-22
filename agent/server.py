@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from agent.environment import Environment, GradingError
 from agent.harness import Harness, load_harness
-from agent.model import MODEL_ID, ModelClient, ModelError
+from agent.model import ModelClient, ModelError
 from agent.oracle_context import OracleContext, OracleContextError, load_oracle_context
 from agent.session import InputError
 from agent.tool_loop import run as run_tool_loop
@@ -91,7 +91,7 @@ def create_app(
         if live_tracer is None:
             live_tracer = create_tracer(
                 agent_name=AGENT_NAME,
-                model_id=MODEL_ID,
+                model_id=model.model_id,
                 harness_name=harness.name,
                 harness_sha256=harness.sha256,
             )
@@ -117,7 +117,7 @@ def create_app(
             "service": "system_agent",
             "agent": AGENT_NAME,
             "mode": SUPPORTED_MODE,
-            "model": MODEL_ID,
+            "model": model.model_id,
             # The real tool set identifies the service, so a stale server that
             # only shares the name cannot be reused by the evaluator.
             "tools": tool_metadata(),
@@ -133,6 +133,8 @@ def create_app(
         # official entries; without the experiment /health is unchanged.
         if oracle is not None:
             info["experiment"] = oracle.descriptor()
+        if model.reasoning_effort is not None:
+            info["reasoning_effort"] = model.reasoning_effort
         return info
 
     @app.post("/init_session")

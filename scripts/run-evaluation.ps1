@@ -25,7 +25,9 @@ $env:DB_ENV_URL = 'http://127.0.0.1:6002'
 $env:USER_SIM_URL = 'http://127.0.0.1:6001'
 # Health values reported by the agent service (agent/server.py).
 $agentName = 'deepseek-v4.1-flash-tool-selecting-two-phase'
-$modelId = 'deepseek/deepseek-v4.1-flash'
+# The simulator stays on the default model; AGENT_MODEL_ID only changes the agent.
+$simulatorModelId = 'deepseek/deepseek-v4.1-flash'
+$modelId = if ($env:AGENT_MODEL_ID) { $env:AGENT_MODEL_ID.Trim() } else { $simulatorModelId }
 $agentUrl = 'http://127.0.0.1:6000'
 $simulatorUrl = 'http://127.0.0.1:6001'
 # The agent offers the nine official tools with their official prices.
@@ -149,7 +151,7 @@ function Assert-BaselineAgent([string]$Url) {
 # Anthropic model without a key.
 function Assert-Simulator([string]$Url) {
     $info = Invoke-RestMethod -Uri "$Url/health" -TimeoutSec 5
-    if ($info.service -ne 'user_simulator_command_code' -or $info.model -ne $modelId -or
+    if ($info.service -ne 'user_simulator_command_code' -or $info.model -ne $simulatorModelId -or
         $info.prompt_version -ne 'v2' -or [int]$info.max_retries -ne 0 -or
         [double]$info.max_output_tokens -ne 16384 -or !$info.api_key_present) {
         throw "The user simulator on port 6001 is not the Command Code v2 connection (service=$($info.service), model=$($info.model), prompt_version=$($info.prompt_version), api_key_present=$($info.api_key_present))."

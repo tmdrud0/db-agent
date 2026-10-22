@@ -7,13 +7,35 @@ from dataclasses import dataclass
 import httpx
 
 API_URL = "https://api.commandcode.ai/provider/v1/chat/completions"
-MODEL_ID = "deepseek/deepseek-v4.1-flash"
+DEFAULT_MODEL_ID = "deepseek/deepseek-v4.1-flash"
+MODEL_ENV = "AGENT_MODEL_ID"
+REASONING_EFFORT_ENV = "AGENT_REASONING_EFFORT"
+# The values Command Code accepts for reasoning_effort.
+REASONING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 REQUEST_TIMEOUT_SECONDS = 300.0
 # The model spends reasoning tokens before writing the action, so a small cap
 # can truncate the response before any action is produced.
 MAX_OUTPUT_TOKENS = 16384
 # The initial call plus three retries. Only transient failures are retried.
 MAX_RETRIES = 3
+
+
+def model_settings(environ) -> tuple[str, str | None]:
+    """The model ID and reasoning effort chosen by the environment.
+
+    Without the variables the model is the default and no reasoning_effort is
+    sent, so the request is the same as before they existed.
+    """
+    model_id = str(environ.get(MODEL_ENV, "")).strip() or DEFAULT_MODEL_ID
+    effort = str(environ.get(REASONING_EFFORT_ENV, "")).strip().lower() or None
+    if effort is not None and effort not in REASONING_EFFORTS:
+        raise ValueError(
+            f"{REASONING_EFFORT_ENV}='{effort}' is not one of {', '.join(REASONING_EFFORTS)}"
+        )
+    return model_id, effort
+
+
+MODEL_ID, REASONING_EFFORT = model_settings(os.environ)
 
 
 class ModelError(RuntimeError):
@@ -43,9 +65,13 @@ class ModelClient:
         self,
         transport: httpx.AsyncBaseTransport | None = None,
         api_key: str | None = None,
+        model_id: str = MODEL_ID,
+        reasoning_effort: str | None = REASONING_EFFORT,
     ):
         self.transport = transport
         self.api_key = api_key
+        self.model_id = model_id
+        self.reasoning_effort = reasoning_effort
 
     def _key(self) -> str:
         key = self.api_key if self.api_key is not None else os.getenv("CMD_API_KEY", "")
@@ -56,11 +82,13 @@ class ModelClient:
 
     async def _complete(self, messages: list[dict]) -> ChatReply:
         payload = {
-            "model": MODEL_ID,
+            "model": self.model_id,
             "messages": messages,
             "stream": False,
             "max_tokens": MAX_OUTPUT_TOKENS,
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         headers = {"Authorization": f"Bearer {self._key()}"}
         started = time.monotonic()
         attempts = MAX_RETRIES + 1
