@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from agent.environment import Environment, GradingError
+from agent.flow import FLOW_ENV, FlowConfig, FlowError, load_flow_config
 from agent.harness import Harness, load_harness
 from agent.model import ModelClient, ModelError
 from agent.oracle_context import OracleContext, OracleContextError, load_oracle_context
@@ -59,6 +60,7 @@ def create_app(
     tracer: Tracer | None = None,
     harness: Harness | None = None,
     oracle_context: OracleContext | None | object = _FROM_ENVIRONMENT,
+    flow: FlowConfig | str | None | object = _FROM_ENVIRONMENT,
 ) -> FastAPI:
     # The tool-selecting loop is the only agent. An explicit request for a
     # removed mode must fail instead of silently running a different agent.
@@ -78,6 +80,18 @@ def create_app(
     oracle = (
         load_oracle_context() if oracle_context is _FROM_ENVIRONMENT else oracle_context
     )
+    # The staged-flow experiment is on only with AGENT_FLOW=staged. A bad value
+    # or a combination the mode does not support stops the server here.
+    flow_config = (
+        load_flow_config() if flow is _FROM_ENVIRONMENT
+        else load_flow_config(flow) if isinstance(flow, str)
+        else flow
+    )
+    if flow_config is not None and harness.sub_agents:
+        raise FlowError(
+            f"{FLOW_ENV}=staged cannot be combined with a harness that defines sub-agents: "
+            f"{harness.name} defines {', '.join(harness.sub_agent_names())}"
+        )
     # The real client is created by the lifespan startup, not here: a test
     # app built without a lifespan must never reach Langfuse just because the
     # shell inherited keys from a previous evaluation run.
@@ -133,6 +147,9 @@ def create_app(
         # official entries; without the experiment /health is unchanged.
         if oracle is not None:
             info["experiment"] = oracle.descriptor()
+        # The staged flow reports its setting; without the mode /health is unchanged.
+        if flow_config is not None:
+            info["flow"] = flow_config.descriptor()
         if model.reasoning_effort is not None:
             info["reasoning_effort"] = model.reasoning_effort
         return info
@@ -167,7 +184,7 @@ def create_app(
             try:
                 response = await run_tool_loop(
                     session.state, req.message, environment, model, active_tracer,
-                    harness=harness, oracle=oracle,
+                    harness=harness, oracle=oracle, flow=flow_config,
                 )
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc

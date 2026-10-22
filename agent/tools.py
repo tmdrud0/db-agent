@@ -75,6 +75,10 @@ class ToolSpec:
     summary: str
     required: tuple[str, ...]
     run: Callable[[Environment, str, dict], Awaitable[str]] | None
+    # Arguments that take a JSON array of non-empty strings instead of a string.
+    list_args: tuple[str, ...] = ()
+    # List arguments that must contain at least one entry.
+    nonempty_list_args: tuple[str, ...] = ()
 
 
 async def _schema(environment: Environment, task_id: str, args: dict) -> str:
@@ -355,6 +359,24 @@ def validate_args(spec: ToolSpec, args) -> dict:
     values = {}
     for name in spec.required:
         value = args[name]
+        if name in spec.list_args:
+            if not isinstance(value, list):
+                raise ActionError(
+                    f"{spec.name} argument '{name}' must be a JSON array of non-empty strings."
+                )
+            items = []
+            for item in value:
+                if not isinstance(item, str) or not item.strip():
+                    raise ActionError(
+                        f"{spec.name} argument '{name}' must contain only non-empty strings."
+                    )
+                items.append(item.strip())
+            if name in spec.nonempty_list_args and not items:
+                raise ActionError(
+                    f"{spec.name} argument '{name}' needs at least one entry."
+                )
+            values[name] = items
+            continue
         if not isinstance(value, str) or not value.strip():
             raise ActionError(f"{spec.name} argument '{name}' must be a non-empty string.")
         values[name] = value.strip()

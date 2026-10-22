@@ -13,6 +13,13 @@ import json
 import time
 
 from agent.environment import Environment, ExecuteResult, GradingError
+from agent.flow import (
+    LOCAL_ACTION_SPECS,
+    FlowConfig,
+    StagedFlow,
+    local_catalog,
+    staged_rules,
+)
 from agent.harness import Harness
 from agent.model import (
     API_URL,
@@ -90,7 +97,9 @@ async def _bounded(awaitable, remaining: float, label: str):
         ) from exc
 
 
-def system_prompt(harness: Harness, oracle: bool = False) -> str:
+def system_prompt(
+    harness: Harness, oracle: bool = False, flow: FlowConfig | None = None
+) -> str:
     """Assemble the harness guidance and the code-owned contract.
 
     Order: harness ``system.md``, code contract, harness ``memory.md``. The
@@ -98,9 +107,12 @@ def system_prompt(harness: Harness, oracle: bool = False) -> str:
     always the text built here; harness files cannot replace it. The consult
     line and its rules appear only when the harness defines a sub-agent, so a
     harness without one builds the same prompt as before. In the oracle-context
-    experiment the catalog lists only the actions that mode allows.
+    experiment the catalog lists only the actions that mode allows. The staged
+    flow adds its local actions and stage rules only when it is on.
     """
     actions = catalog(harness.tool_notes, _oracle_tools() if oracle else None)
+    if flow is not None:
+        actions += "\n" + local_catalog()
     rules = (
         "- Only the actions above exist. Any other action name is rejected without cost.\n"
         "- execute_sql explores with one read-only statement. Its result never changes the score\n"
@@ -137,6 +149,8 @@ def system_prompt(harness: Harness, oracle: bool = False) -> str:
                 "  cost, and its raw output is shown only to the sub-agent; the main agent receives\n"
                 "  only the sub-agent's answer."
             )
+    if flow is not None:
+        rules += "\n" + staged_rules(flow)
     contract = (
         "Reply with one JSON object and nothing else:\n"
         '{"action": "<tool name>", "args": {<tool arguments>}}\n'
@@ -162,7 +176,12 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _initial_prompt(state: dict, query: str, context: TaskContext | None = None) -> str:
+def _initial_prompt(
+    state: dict,
+    query: str,
+    context: TaskContext | None = None,
+    flow: StagedFlow | None = None,
+) -> str:
     initial = state.get("initial_budget")
     if isinstance(initial, (int, float)):
         # The oracle-context experiment starts with its offset already taken, so
@@ -172,18 +191,40 @@ def _initial_prompt(state: dict, query: str, context: TaskContext | None = None)
     else:
         given = f"{budget(state):g}"
     provided = f"{initial_section(context)}\n\n" if context is not None else ""
-    return (
+    text = (
         f"{database_line(state)}User Query:\n{query}\n\n{provided}"
         f"You have {given} bird-coins for this task and {budget(state):g} remain. "
         "Send one JSON action."
     )
+    if flow is not None:
+        text += (
+            f"\nStaged flow: phase {state.get('current_phase', 1)} starts in the "
+            f"{flow.stage} stage. Allowed actions: {', '.join(flow.allowed_names())}."
+        )
+    return text
 
 
-def _observation(index: int, phase: int, name: str, cost: float, state: dict, body: str) -> str:
-    return (
-        f"[action {index} | phase {phase} | {name} | cost {cost:g} | "
-        f"budget {budget(state):g}]\n{body}"
-    )
+def _observation(
+    index: int,
+    phase: int,
+    name: str,
+    cost: float,
+    state: dict,
+    body: str,
+    flow: StagedFlow | None = None,
+) -> str:
+    if flow is None:
+        head = (
+            f"[action {index} | phase {phase} | {name} | cost {cost:g} | "
+            f"budget {budget(state):g}]"
+        )
+    else:
+        head = (
+            f"[action {index} | phase {phase} | stage {flow.stage} | "
+            f"allowed {', '.join(flow.allowed_names())} | {name} | cost {cost:g} | "
+            f"budget {budget(state):g}]"
+        )
+    return f"{head}\n{body}"
 
 
 def _action_history(name: str, args: dict) -> dict:
@@ -277,6 +318,14 @@ async def _model_call(
     # The runner keeps adk_events, so the experiment marker reaches the result JSON.
     if "experiment" in state:
         event["experiment"] = dict(state["experiment"])
+    # The staged flow records the stage that answered this call and its setting
+    # summary. Neither field exists in the free loop.
+    flow_state = state.get("flow")
+    if isinstance(flow_state, dict):
+        event["stage"] = flow_state.get("stage")
+        event["flow"] = {
+            "mode": flow_state.get("mode"), "setting": flow_state.get("setting"),
+        }
     events.append(event)
     return reply, event, generation
 
@@ -347,6 +396,7 @@ async def _submit_action(
     trace: SessionTrace | None = None,
     notice: str = "",
     follow_up_context: str = "",
+    flow: StagedFlow | None = None,
 ) -> tuple[str, str] | None:
     """Submit to the official grader. Returns the stop reason when the task ends."""
     budget_before = budget(state)
@@ -396,10 +446,13 @@ async def _submit_action(
     if not result.passed:
         if span is not None:
             span.finish(entry)
+        body = result.message + notice
+        if flow is not None:
+            body += "\n" + flow.on_submit_failed(index)
         messages.append({
             "role": "user",
             "content": _observation(
-                index, phase, "submit_sql", SUBMIT_COST, state, result.message + notice
+                index, phase, "submit_sql", SUBMIT_COST, state, body, flow=flow
             ),
         })
         return None
@@ -456,9 +509,18 @@ async def _submit_action(
             + (f"\n\n{follow_up_context}" if follow_up_context else "")
             + notice
         )
+        if flow is not None:
+            body += "\n" + flow.on_phase1_passed(index)
+        # The staged header names the phase the flow is now in; the free loop
+        # keeps the phase of the submission it answered.
+        display_phase = (
+            int(state.get("current_phase", phase)) if flow is not None else phase
+        )
         messages.append({
             "role": "user",
-            "content": _observation(index, phase, "submit_sql", SUBMIT_COST, state, body),
+            "content": _observation(
+                index, display_phase, "submit_sql", SUBMIT_COST, state, body, flow=flow
+            ),
         })
         return None
 
@@ -797,6 +859,7 @@ async def run(
     *,
     harness: Harness,
     oracle: OracleContext | None = None,
+    flow: FlowConfig | None = None,
 ) -> str:
     _record_harness(state, harness)
     # Repeated requests return the cached outcome instead of calling out again.
@@ -816,7 +879,7 @@ async def run(
             trace = None
     try:
         response = await _session_loop(
-            state, query, environment, model, trace, harness, context
+            state, query, environment, model, trace, harness, context, flow
         )
     except ModelError as exc:
         if trace is not None:
@@ -845,15 +908,22 @@ async def _session_loop(
     trace: SessionTrace | None,
     harness: Harness,
     context: TaskContext | None = None,
+    flow_config: FlowConfig | None = None,
 ) -> str:
     started = _now()
     deadline = started + SESSION_TIME_LIMIT_SECONDS
     oracle = context is not None
     allowed = _allowed_actions(harness, oracle)
+    # Local flow actions are parseable only in the staged mode; the stage check
+    # then decides whether the current stage allows the parsed action.
+    parse_tools = {**allowed, **LOCAL_ACTION_SPECS} if flow_config is not None else allowed
     follow_up_context = follow_up_section(context) if oracle else ""
+    staged = (
+        StagedFlow(flow_config, state, allowed) if flow_config is not None else None
+    )
     messages = [
-        {"role": "system", "content": system_prompt(harness, oracle)},
-        {"role": "user", "content": _initial_prompt(state, query, context)},
+        {"role": "system", "content": system_prompt(harness, oracle, flow_config)},
+        {"role": "user", "content": _initial_prompt(state, query, context, staged)},
     ]
 
     def stop(reason: str, response: str) -> str:
@@ -881,6 +951,12 @@ async def _session_loop(
                 f"Stopped: {budget(state):g} bird-coins remain and a submission costs "
                 f"{SUBMIT_COST:g}. {_outcome(state)}",
             )
+        # The staged flow never leaves the model in a stage whose paid actions
+        # it cannot afford: the loop moves to submit and says so before the call.
+        if staged is not None:
+            notice = staged.ensure_progress(budget(state), index)
+            if notice:
+                messages.append({"role": "user", "content": notice})
 
         try:
             reply, event, generation = await _model_call(
@@ -904,22 +980,29 @@ async def _session_loop(
                     "The response hit the output token limit, so no action was executed. "
                     "Reply with one complete JSON action."
                 )
-            parsed = parse_response(reply.content, allowed)
+            parsed = parse_response(reply.content, parse_tools)
             if parsed.name == "consult" and parsed.args["agent"] not in harness.sub_agents:
                 available = ", ".join(harness.sub_agents) or "none"
                 raise ActionError(
                     f"Unknown sub-agent '{parsed.args['agent']}'. "
                     f"Available sub-agents: {available}."
                 )
+            if staged is not None:
+                staged.check(parsed.name, parsed.args, budget(state))
         except ActionError as exc:
             reason = str(exc)
             event["action_error"] = reason
-            event["action"] = None
+            event["action"] = getattr(exc, "action", None)
+            rejection = getattr(exc, "kind", None)
+            if rejection is not None:
+                event["rejection"] = rejection
             if generation is not None:
                 generation.finish(reply, action_error=reason)
             messages.append({
                 "role": "user",
-                "content": _observation(index, phase, "rejected", 0.0, state, reason),
+                "content": _observation(
+                    index, phase, "rejected", 0.0, state, reason, flow=staged
+                ),
             })
             continue
         name, args = parsed.name, parsed.args
@@ -941,11 +1024,20 @@ async def _session_loop(
         notice = _ignored_notice(parsed)
 
         action_budget = budget(state)
+        if staged is not None and name in LOCAL_ACTION_SPECS:
+            content = staged.run_local(name, args, index, phase)
+            messages.append({
+                "role": "user",
+                "content": _observation(
+                    index, phase, name, 0.0, state, content + notice, flow=staged
+                ),
+            })
+            continue
         try:
             if name == "submit_sql":
                 outcome = await _submit_action(
                     state, environment, args["sql"], phase, messages, index, deadline, trace,
-                    notice=notice, follow_up_context=follow_up_context,
+                    notice=notice, follow_up_context=follow_up_context, flow=staged,
                 )
                 if outcome is not None:
                     return stop(*outcome)
@@ -955,10 +1047,14 @@ async def _session_loop(
                 content = await _execute_action(
                     state, environment, args["sql"], phase, deadline, trace
                 )
+                if staged is not None:
+                    staged.mark_tested()
             elif name == "ask_user":
                 content = await _ask_action(
                     state, environment, args["question"], phase, deadline, trace
                 )
+                if staged is not None:
+                    content += staged.on_ask(index)
             elif name == "consult":
                 content = await _consult_action(
                     state, model, harness, environment, args["agent"], args["request"], query,
@@ -979,5 +1075,7 @@ async def _session_loop(
             cost = ALLOWED_TOOLS[name].cost
         messages.append({
             "role": "user",
-            "content": _observation(index, phase, name, cost, state, content + notice),
+            "content": _observation(
+                index, phase, name, cost, state, content + notice, flow=staged
+            ),
         })
