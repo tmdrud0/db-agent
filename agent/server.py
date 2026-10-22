@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from agent.environment import Environment, GradingError
 from agent.harness import Harness, load_harness
 from agent.model import MODEL_ID, ModelClient, ModelError
+from agent.oracle_context import OracleContext, OracleContextError, load_oracle_context
 from agent.session import InputError
 from agent.tool_loop import run as run_tool_loop
 from agent.tools import tool_metadata
@@ -27,6 +28,8 @@ from agent.tracing import (
 
 AGENT_NAME = "deepseek-v4.1-flash-tool-selecting-two-phase"
 SUPPORTED_MODE = "tools"
+# Marks "read AGENT_ORACLE_CONTEXT_DIR" apart from an explicit None (mode off).
+_FROM_ENVIRONMENT = object()
 
 
 class InitRequest(BaseModel):
@@ -55,6 +58,7 @@ def create_app(
     mode: str | None = None,
     tracer: Tracer | None = None,
     harness: Harness | None = None,
+    oracle_context: OracleContext | None | object = _FROM_ENVIRONMENT,
 ) -> FastAPI:
     # The tool-selecting loop is the only agent. An explicit request for a
     # removed mode must fail instead of silently running a different agent.
@@ -69,6 +73,11 @@ def create_app(
     # The harness is read once when the server is created. Changes to its files
     # do not affect a running server.
     harness = harness if harness is not None else load_harness()
+    # The diagnostic oracle-context experiment (TASK-015) is on only when its
+    # directory is configured; a configured but unusable directory stops here.
+    oracle = (
+        load_oracle_context() if oracle_context is _FROM_ENVIRONMENT else oracle_context
+    )
     # The real client is created by the lifespan startup, not here: a test
     # app built without a lifespan must never reach Langfuse just because the
     # shell inherited keys from a previous evaluation run.
@@ -103,7 +112,7 @@ def create_app(
 
     @app.get("/health")
     async def health():
-        return {
+        info = {
             "status": "healthy",
             "service": "system_agent",
             "agent": AGENT_NAME,
@@ -120,6 +129,11 @@ def create_app(
             "execute_sql_timeout_seconds": environment.execute_sql_timeout,
             "ask_user_timeout_seconds": environment.ask_user_timeout,
         }
+        # The experiment is reported next to the tools, which stay the nine
+        # official entries; without the experiment /health is unchanged.
+        if oracle is not None:
+            info["experiment"] = oracle.descriptor()
+        return info
 
     @app.post("/init_session")
     async def init_session(req: InitRequest):
@@ -151,10 +165,12 @@ def create_app(
             try:
                 response = await run_tool_loop(
                     session.state, req.message, environment, model, active_tracer,
-                    harness=harness,
+                    harness=harness, oracle=oracle,
                 )
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc
+            except OracleContextError as exc:
+                raise HTTPException(500, f"Oracle context error: {exc}") from exc
             except ModelError as exc:
                 # Report the failure source explicitly instead of fabricating
                 # a valid failed submission with reward=0.

@@ -23,6 +23,13 @@ from agent.model import (
     ModelClient,
     ModelError,
 )
+from agent.oracle_context import (
+    ORACLE_ACTIONS,
+    OracleContext,
+    TaskContext,
+    follow_up_section,
+    initial_section,
+)
 from agent.session import (
     budget,
     database_line,
@@ -83,16 +90,17 @@ async def _bounded(awaitable, remaining: float, label: str):
         ) from exc
 
 
-def system_prompt(harness: Harness) -> str:
+def system_prompt(harness: Harness, oracle: bool = False) -> str:
     """Assemble the harness guidance and the code-owned contract.
 
     Order: harness ``system.md``, code contract, harness ``memory.md``. The
     contract (response format, tools, prices, limits, rewards, phase rules) is
     always the text built here; harness files cannot replace it. The consult
     line and its rules appear only when the harness defines a sub-agent, so a
-    harness without one builds the same prompt as before.
+    harness without one builds the same prompt as before. In the oracle-context
+    experiment the catalog lists only the actions that mode allows.
     """
-    actions = catalog(harness.tool_notes)
+    actions = catalog(harness.tool_notes, _oracle_tools() if oracle else None)
     rules = (
         "- Only the actions above exist. Any other action name is rejected without cost.\n"
         "- execute_sql explores with one read-only statement. Its result never changes the score\n"
@@ -154,11 +162,18 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _initial_prompt(state: dict, query: str) -> str:
+def _initial_prompt(state: dict, query: str, context: TaskContext | None = None) -> str:
     initial = state.get("initial_budget")
-    given = f"{float(initial):g}" if isinstance(initial, (int, float)) else f"{budget(state):g}"
+    if isinstance(initial, (int, float)):
+        # The oracle-context experiment starts with its offset already taken, so
+        # the coins it announces are the ones the model can actually spend.
+        offset = float(state["experiment"]["budget_offset"]) if context is not None else 0.0
+        given = f"{float(initial) - offset:g}"
+    else:
+        given = f"{budget(state):g}"
+    provided = f"{initial_section(context)}\n\n" if context is not None else ""
     return (
-        f"{database_line(state)}User Query:\n{query}\n\n"
+        f"{database_line(state)}User Query:\n{query}\n\n{provided}"
         f"You have {given} bird-coins for this task and {budget(state):g} remain. "
         "Send one JSON action."
     )
@@ -198,11 +213,20 @@ def _model_actions(state: dict) -> int:
     return sum(1 for event in state.get("adk_events", []) if event.get("type") == "model_call")
 
 
-def _allowed_actions(harness: Harness) -> dict[str, ToolSpec]:
-    """The official tools, plus consult only when the harness defines a sub-agent."""
+def _oracle_tools() -> dict[str, ToolSpec]:
+    return {name: ALLOWED_TOOLS[name] for name in ORACLE_ACTIONS}
+
+
+def _allowed_actions(harness: Harness, oracle: bool = False) -> dict[str, ToolSpec]:
+    """The official tools, plus consult only when the harness defines a sub-agent.
+
+    The oracle-context experiment drops the six information lookups, so they
+    are rejected as unknown actions without cost.
+    """
+    tools = _oracle_tools() if oracle else ALLOWED_TOOLS
     if not harness.sub_agents:
-        return ALLOWED_TOOLS
-    return {**ALLOWED_TOOLS, "consult": CONSULT_SPEC}
+        return tools
+    return {**tools, "consult": CONSULT_SPEC}
 
 
 async def _model_call(
@@ -250,6 +274,9 @@ async def _model_call(
         "elapsed_seconds": reply.elapsed_seconds,
         "prompt": [dict(message) for message in messages],
     }
+    # The runner keeps adk_events, so the experiment marker reaches the result JSON.
+    if "experiment" in state:
+        event["experiment"] = dict(state["experiment"])
     events.append(event)
     return reply, event, generation
 
@@ -319,6 +346,7 @@ async def _submit_action(
     deadline: float,
     trace: SessionTrace | None = None,
     notice: str = "",
+    follow_up_context: str = "",
 ) -> tuple[str, str] | None:
     """Submit to the official grader. Returns the stop reason when the task ends."""
     budget_before = budget(state)
@@ -424,7 +452,9 @@ async def _submit_action(
             span.finish(entry, phase_transition=state["phase_transition"])
         body = (
             f"{result.message}\nThe phase 1 SQL is applied to the database.\n"
-            f"Follow-up question:\n{result.follow_up_query or ''}" + notice
+            f"Follow-up question:\n{result.follow_up_query or ''}"
+            + (f"\n\n{follow_up_context}" if follow_up_context else "")
+            + notice
         )
         messages.append({
             "role": "user",
@@ -728,6 +758,25 @@ async def _consult_action(
     return body
 
 
+def _start_oracle_context(state: dict, oracle: OracleContext) -> TaskContext:
+    """Load the task's prebuilt context and take the budget offset once.
+
+    A missing or invalid file raises before anything is charged or recorded.
+    The official ``initial_budget`` stays as the runner sent it; only the
+    remaining budget starts lower, and ``experiment`` records why.
+    """
+    context = oracle.load(str(state.get("task_id") or ""))
+    if "experiment" not in state:
+        offset = oracle.descriptor()["budget_offset"]
+        state["budget_remaining"] = budget(state) - offset
+        state["experiment"] = {
+            **oracle.descriptor(),
+            "context_sha256": context.sha256,
+            "context_chars": context.chars(),
+        }
+    return context
+
+
 def _record_harness(state: dict, harness: Harness) -> None:
     """Keep the harness identity in the session state.
 
@@ -747,6 +796,7 @@ async def run(
     tracer: Tracer | None = None,
     *,
     harness: Harness,
+    oracle: OracleContext | None = None,
 ) -> str:
     _record_harness(state, harness)
     # Repeated requests return the cached outcome instead of calling out again.
@@ -757,6 +807,7 @@ async def run(
         raise restore_failure(state["failure"])
 
     query = resolve_query(state, message)
+    context = _start_oracle_context(state, oracle) if oracle is not None else None
     trace = None
     if tracer is not None:
         try:
@@ -764,7 +815,9 @@ async def run(
         except Exception:
             trace = None
     try:
-        response = await _session_loop(state, query, environment, model, trace, harness)
+        response = await _session_loop(
+            state, query, environment, model, trace, harness, context
+        )
     except ModelError as exc:
         if trace is not None:
             trace.fail("model", str(exc))
@@ -791,13 +844,16 @@ async def _session_loop(
     model: ModelClient,
     trace: SessionTrace | None,
     harness: Harness,
+    context: TaskContext | None = None,
 ) -> str:
     started = _now()
     deadline = started + SESSION_TIME_LIMIT_SECONDS
-    allowed = _allowed_actions(harness)
+    oracle = context is not None
+    allowed = _allowed_actions(harness, oracle)
+    follow_up_context = follow_up_section(context) if oracle else ""
     messages = [
-        {"role": "system", "content": system_prompt(harness)},
-        {"role": "user", "content": _initial_prompt(state, query)},
+        {"role": "system", "content": system_prompt(harness, oracle)},
+        {"role": "user", "content": _initial_prompt(state, query, context)},
     ]
 
     def stop(reason: str, response: str) -> str:
@@ -889,7 +945,7 @@ async def _session_loop(
             if name == "submit_sql":
                 outcome = await _submit_action(
                     state, environment, args["sql"], phase, messages, index, deadline, trace,
-                    notice=notice,
+                    notice=notice, follow_up_context=follow_up_context,
                 )
                 if outcome is not None:
                     return stop(*outcome)

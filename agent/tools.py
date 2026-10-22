@@ -172,14 +172,17 @@ ALLOWED_TOOLS = {
 TOOL_COSTS = {name: spec.cost for name, spec in ALLOWED_TOOLS.items()}
 
 
-def catalog(notes: dict[str, str] | None = None) -> str:
+def catalog(
+    notes: dict[str, str] | None = None, specs: Mapping[str, ToolSpec] | None = None
+) -> str:
     """The tool list shown to the model, one action per line.
 
     Harness-provided guidance for a tool is appended under its line; without a
-    note the catalog is unchanged.
+    note the catalog is unchanged. ``specs`` narrows the list for the
+    oracle-context experiment; by default all nine official tools are listed.
     """
     lines = []
-    for spec in ALLOWED_TOOLS.values():
+    for spec in (ALLOWED_TOOLS if specs is None else specs).values():
         lines.append(
             f"- {spec.name}: {spec.summary}. arguments: {spec.arguments}. Cost: {spec.cost:g}"
         )
