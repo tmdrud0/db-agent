@@ -9,6 +9,14 @@ never reaches an official service and is never charged.
 Without the variable, or with ``free``, nothing in this module is used and the
 loop, its prompt, its action set, ``/health`` and its result records are the
 same as before the mode existed.
+
+``AGENT_FLOW=staged_open`` keeps the same stages and order constraints but
+reads the two common shortcuts as transitions instead of rejecting them:
+execute_sql in ask moves to verify and runs, and submit_sql in verify after a
+test moves to submit and submits (execute_sql in submit returns to verify).
+ask_user stays allowed in verify up to the phase ask limit, and every
+observation ends with a one-line guide for the current stage. The system
+prompt stays fixed, so the prompt cache is kept.
 """
 
 import os
@@ -29,6 +37,7 @@ PHASE2_RESERVE_ENV = "AGENT_PHASE2_RESERVE"
 ASK_LIMIT_ENV = "AGENT_ASK_LIMIT"
 FREE = "free"
 STAGED = "staged"
+STAGED_OPEN = "staged_open"
 # The average dev30 task carries about four relevant ambiguities (3.17
 # important plus 0.83 deleted knowledge), and one ask_user costs 2 coins.
 # Four questions per phase covers that average without spending the whole
@@ -106,6 +115,10 @@ class FlowConfig:
     ask_limit: int = DEFAULT_ASK_LIMIT
     phase2_reserve: float = DEFAULT_PHASE2_RESERVE
 
+    @property
+    def open(self) -> bool:
+        return self.setting == STAGED_OPEN
+
     def descriptor(self) -> dict:
         return {
             "mode": STAGED,
@@ -154,9 +167,10 @@ def load_flow_config(
     value = str(raw).strip().lower()
     if not value or value == FREE:
         return None
-    if value != STAGED:
+    if value not in (STAGED, STAGED_OPEN):
         raise FlowError(
-            f"{FLOW_ENV}={value!r} is not supported; use {FREE!r} or {STAGED!r}"
+            f"{FLOW_ENV}={value!r} is not supported; use {FREE!r}, {STAGED!r} or "
+            f"{STAGED_OPEN!r}"
         )
     return FlowConfig(
         setting=value,
@@ -184,6 +198,44 @@ def local_catalog() -> str:
     return "\n".join(lines)
 
 
+STAGE_GUIDES = {
+    UNDERSTAND: ("Stage guide (understand): read the provided context or lookups, then send plan "
+                 "listing every undefined term, threshold, open intent and result detail as a "
+                 "question, plus the assumptions you will make."),
+    ASK: ("Stage guide (ask): ask the open points with ask_user, several numbered points per "
+          "question with concrete values to confirm. When nothing is left to ask, send "
+          "execute_sql to start testing."),
+    VERIFY: ("Stage guide (verify): check values, formats and NULLs and test the candidate SQL "
+             "with execute_sql. ask_user is still allowed while the phase ask limit lasts. When "
+             "the tested SQL is ready, send submit_sql."),
+    SUBMIT: ("Stage guide (submit): send submit_sql with the SQL you tested, or execute_sql to "
+             "test again."),
+}
+
+
+def _open_rules(config: FlowConfig, budget_line: str) -> str:
+    return (
+        "- Staged flow is on. The observation header shows the current stage and the actions it\n"
+        "  allows, and each observation ends with a guide for that stage.\n"
+        "- understand: use this task's information lookups, then call plan with the open questions\n"
+        "  and the assumptions you will make without asking. Declared questions lead to ask; an\n"
+        "  empty question list leads to verify.\n"
+        "- ask: ask the declared questions with ask_user, grouped by topic. Sending execute_sql\n"
+        "  ends the ask stage, moves to verify and runs the statement; plan_done also moves on.\n"
+        "- verify: run execute_sql at least once in this phase and check values, formats and NULLs.\n"
+        "  ask_user, get_column_meaning and get_knowledge_definition are also allowed here.\n"
+        "  submit_sql after a test in this phase moves to submit and submits; ready also moves on.\n"
+        "- submit: submit_sql submits; execute_sql returns to verify and runs. A failed\n"
+        "  submission returns to verify; a passing phase 1 submission starts phase 2 at understand.\n"
+        "- plan, plan_done, reopen and ready are local actions, not official tools. They cost no\n"
+        "  bird-coins, but the response that chooses one counts as one model action.\n"
+        "- Any other action outside the current stage is rejected without cost, and the\n"
+        "  observation lists the actions the stage allows.\n"
+        f"{budget_line}\n"
+        f"- ask_user is limited to {config.ask_limit} calls per phase."
+    )
+
+
 def staged_rules(config: FlowConfig) -> str:
     if config.phase2_reserve > 0:
         budget_line = (
@@ -197,6 +249,8 @@ def staged_rules(config: FlowConfig) -> str:
             f"- A non-submission action is rejected without cost when it would leave fewer than\n"
             f"  {SUBMIT_COST:g} bird-coins, so a submission stays possible."
         )
+    if config.open:
+        return _open_rules(config, budget_line)
     return (
         "- Staged flow is on. The observation header shows the current stage and the actions it\n"
         "  allows.\n"
@@ -260,7 +314,41 @@ class StagedFlow:
         return int(self.data["phase"])
 
     def allowed(self) -> dict[str, ToolSpec]:
-        return allowed_specs(self.stage, self.overall)
+        specs = allowed_specs(self.stage, self.overall)
+        if self.config.open and self.stage == VERIFY and "ask_user" in self.overall:
+            specs = {"ask_user": self.overall["ask_user"], **specs}
+        return specs
+
+    def guide(self) -> str:
+        """The one-line guide for the current stage; empty unless the mode is open."""
+        return STAGE_GUIDES[self.stage] if self.config.open else ""
+
+    def adapt(self, name: str, current_budget: float, action: int) -> str:
+        """Read the open mode's shortcuts as transitions before the stage check.
+
+        Returns a sentence for the observation, or an empty string when nothing
+        changed. A submit_sql in verify before any test is refused here, so the
+        test-before-submit order still holds.
+        """
+        if not self.config.open:
+            return ""
+        if self.stage == ASK and name == "execute_sql":
+            self._transition(VERIFY, "implicit_plan_done", action)
+            return "\nexecute_sql ended the ask stage, so the flow moved to the verify stage."
+        if self.stage == SUBMIT and name == "execute_sql":
+            self._transition(VERIFY, "implicit_verify", action)
+            return "\nexecute_sql moved the flow back to the verify stage."
+        if self.stage == VERIFY and name == "submit_sql":
+            if not self.data["tested"] and current_budget >= SUBMIT_COST + EXECUTE_SQL_COST:
+                self._reject(
+                    "flow",
+                    "Run execute_sql at least once in this phase before submit_sql. Nothing was "
+                    "executed and no bird-coins were charged.",
+                    name, {},
+                )
+            self._transition(SUBMIT, "implicit_ready", action)
+            return "\nsubmit_sql moved the flow from verify to the submit stage."
+        return ""
 
     def allowed_names(self) -> list[str]:
         return list(self.allowed())
@@ -369,11 +457,12 @@ class StagedFlow:
             return None
         blocked = self.stage
         self._transition(SUBMIT, "no_affordable_action", action)
+        guide = f"\n{self.guide()}" if self.config.open else ""
         return flow_notice(
             action, self.phase,
             f"No action of the {blocked} stage can be paid for while keeping a submission "
             "possible, so the flow moved to the submit stage. Allowed actions here: "
-            f"{', '.join(self.allowed_names())}. Submit the SQL you have.",
+            f"{', '.join(self.allowed_names())}. Submit the SQL you have.{guide}",
         )
 
     def mark_tested(self) -> None:
@@ -393,6 +482,12 @@ class StagedFlow:
             return (
                 "The phase's ask limit is already used up, so the flow moved to the ask stage "
                 "only to let you call plan_done."
+            )
+        if self.config.open:
+            return (
+                f"The flow moved to the ask stage. Ask the {allowance} question(s) with ask_user; "
+                f"ask_user stays available in verify while the phase limit of "
+                f"{self.config.ask_limit} lasts."
             )
         return (
             f"The flow moved to the ask stage. Ask up to {allowance} question(s) with "
@@ -466,6 +561,10 @@ class StagedFlow:
 
     def on_ask(self, action: int) -> str:
         """Count one answered question and leave ask when its target is met."""
+        if self.stage != ASK:
+            # The open mode also asks in verify; that question only counts.
+            self.data["asked_in_phase"] += 1
+            return ""
         pending = len(self.data["pending_questions"])
         allowance = self._ask_allowance()
         self.data["asked_in_stage"] += 1

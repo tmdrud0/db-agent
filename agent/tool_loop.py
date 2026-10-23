@@ -201,6 +201,8 @@ def _initial_prompt(
             f"\nStaged flow: phase {state.get('current_phase', 1)} starts in the "
             f"{flow.stage} stage. Allowed actions: {', '.join(flow.allowed_names())}."
         )
+        if flow.guide():
+            text += f"\n{flow.guide()}"
     return text
 
 
@@ -224,6 +226,10 @@ def _observation(
             f"allowed {', '.join(flow.allowed_names())} | {name} | cost {cost:g} | "
             f"budget {budget(state):g}]"
         )
+        # The open mode ends every observation with the current stage's guide; the
+        # system prompt stays fixed, so the cached prefix is kept.
+        if flow.guide():
+            body = f"{body}\n{flow.guide()}"
     return f"{head}\n{body}"
 
 
@@ -974,6 +980,7 @@ async def _session_loop(
                 f"Stopped: {_limit_text()} was reached after the model response, so the action "
                 f"was not executed. {_outcome(state)}",
             )
+        adapt_note = ""
         try:
             if reply.truncated:
                 raise ActionError(
@@ -988,9 +995,12 @@ async def _session_loop(
                     f"Available sub-agents: {available}."
                 )
             if staged is not None:
+                # The open mode reads its shortcuts as transitions first; the
+                # stage check then sees the stage the action belongs to.
+                adapt_note = staged.adapt(parsed.name, budget(state), index)
                 staged.check(parsed.name, parsed.args, budget(state))
         except ActionError as exc:
-            reason = str(exc)
+            reason = str(exc) + adapt_note
             event["action_error"] = reason
             event["action"] = getattr(exc, "action", None)
             rejection = getattr(exc, "kind", None)
@@ -1021,7 +1031,7 @@ async def _session_loop(
                 action_count=parsed.action_count if parsed.action_count > 1 else None,
                 ignored_actions=parsed.ignored_actions or None,
             )
-        notice = _ignored_notice(parsed)
+        notice = _ignored_notice(parsed) + adapt_note
 
         action_budget = budget(state)
         if staged is not None and name in LOCAL_ACTION_SPECS:

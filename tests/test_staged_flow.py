@@ -784,6 +784,139 @@ class OracleStagedTests(StagedFlowTestCase):
         self.assertEqual(self.paths(), ["/execute", "/submit"])
 
 
+class OpenFlowTests(StagedFlowTestCase):
+    """AGENT_FLOW=staged_open: shortcuts become transitions, asks stay open in verify."""
+
+    harness_name = "staged_ask_open"
+    flow_config = FlowConfig(setting="staged_open")
+
+    def test_the_setting_is_read_and_reported(self):
+        config = load_flow_config(environ={FLOW_ENV: "staged_open"})
+        self.assertEqual(config, FlowConfig(setting="staged_open"))
+        self.assertTrue(config.open)
+        self.assertFalse(FlowConfig().open)
+        self.assertEqual(self.client.get("/health").json()["flow"]["setting"], "staged_open")
+
+    def test_execute_in_ask_and_submit_in_verify_are_transitions_not_rejections(self):
+        self.actions = [
+            plan(["Q one", "Q two"], ["A one"]),
+            action("ask_user", question="Q one"),
+            action("execute_sql", sql="SELECT 1"),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/ask", "/execute", "/submit"])
+        # Each model_call records the stage it was called in, before its action.
+        self.assertEqual(self.stages(state), ["understand", "ask", "ask", "verify"])
+        self.assertEqual(self.transitions(state), [
+            (1, "understand", "ask", "plan"),
+            (1, "ask", "verify", "implicit_plan_done"),
+            (1, "verify", "submit", "implicit_ready"),
+        ])
+        self.assertFalse(any(event.get("action_error") for event in model_events(state)))
+        execute_observation = self.model_requests[3]["messages"][-1]["content"]
+        self.assertIn("execute_sql ended the ask stage", execute_observation)
+        self.assertTrue(execute_observation.startswith("[action 3 | phase 1 | stage verify |"))
+        self.assertTrue(execute_observation.endswith(
+            "When the tested SQL is ready, send submit_sql."
+        ))
+        systems = {request["messages"][0]["content"] for request in self.model_requests}
+        self.assertEqual(len(systems), 1)
+        self.assertIn("Sending execute_sql\n  ends the ask stage", systems.pop())
+
+    def test_submit_before_a_test_is_still_refused_without_cost(self):
+        self.actions = [
+            plan([]),
+            action("submit_sql", sql="SELECT 1;"),
+            action("execute_sql", sql="SELECT 1"),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/execute", "/submit"])
+        event = model_events(state)[1]
+        self.assertEqual(event["rejection"], "flow")
+        self.assertIn("Run execute_sql at least once", event["action_error"])
+        self.assertIn("| cost 0 |", self.model_requests[2]["messages"][-1]["content"])
+
+    def test_ask_user_stays_open_in_verify_within_the_phase_limit(self):
+        self.actions = [
+            plan(["Q one"]),
+            action("ask_user", question="Q one"),
+            action("ask_user", question="Q two"),
+            action("execute_sql", sql="SELECT 1"),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/ask", "/ask", "/execute", "/submit"])
+        self.assertEqual(self.stages(state), ["understand", "ask", "verify", "verify", "verify"])
+        self.assertEqual(state["flow"]["asked_in_phase"], 2)
+        self.assertIn("ask_user stays available in verify",
+                      self.model_requests[1]["messages"][-1]["content"])
+
+    def test_the_phase_ask_limit_still_applies_in_verify(self):
+        self.client = self.build_client(FlowConfig(setting="staged_open", ask_limit=1))
+        self.actions = [
+            plan(["Q one"]),
+            action("ask_user", question="Q one"),
+            action("ask_user", question="Q two"),
+            action("execute_sql", sql="SELECT 1"),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/ask", "/execute", "/submit"])
+        self.assertIn("ask limit of 1", model_events(state)[2]["action_error"])
+
+    def test_execute_in_submit_returns_to_verify(self):
+        self.actions = [
+            plan([]),
+            action("execute_sql", sql="SELECT 1"),
+            action("ready"),
+            action("execute_sql", sql="SELECT 2"),
+            action("submit_sql", sql="SELECT 2;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        self.assertEqual(self.paths(), ["/execute", "/execute", "/submit"])
+        self.assertEqual([item[3] for item in self.transitions(state)],
+                         ["plan", "ready", "implicit_verify", "implicit_ready"])
+
+    def test_the_first_message_ends_with_the_understand_guide(self):
+        self.actions = [plan([]), action("execute_sql", sql="SELECT 1"),
+                        action("submit_sql", sql="SELECT 1;")]
+        self.grader_payload = dict(PHASE1_FINAL)
+        self.run_ok()
+        self.assertTrue(self.model_requests[0]["messages"][1]["content"].endswith(
+            "plus the assumptions you will make."
+        ))
+
+    def test_the_staged_mode_still_rejects_the_shortcuts(self):
+        self.client = self.build_client(FlowConfig())
+        self.actions = [
+            plan(["Q one"]),
+            action("execute_sql", sql="SELECT 1"),
+            action("plan_done"),
+            action("execute_sql", sql="SELECT 1"),
+            action("submit_sql", sql="SELECT 1;"),
+            action("ready"),
+            action("submit_sql", sql="SELECT 1;"),
+        ]
+        self.grader_payload = dict(PHASE1_FINAL)
+        state = self.run_ok()
+
+        errors = [event.get("rejection") for event in model_events(state)]
+        self.assertEqual(errors.count("stage"), 2)
+        self.assertNotIn("Stage guide", json.dumps(self.model_requests))
+
+
 class SubAgentConflictTests(unittest.TestCase):
     def test_a_harness_with_sub_agents_stops_the_server_at_startup(self):
         harness = load_harness(ROOT / "harness" / "sql_review")
