@@ -500,6 +500,23 @@ class ExampleHarnessTests(unittest.TestCase):
             list(TOOL_COSTS),
         )
 
+    def test_the_staged_ask_define_harness_asks_open_questions(self):
+        harness = load_harness("harness/staged_ask_define")
+        self.assertEqual(harness.sub_agents, {})
+        self.assertEqual(list(harness.tool_notes), ["ask_user"])
+        prompt = system_prompt(harness)
+        self.assertIn(
+            "  Usage note:\n"
+            "  The task user knows exactly which result they want and answers with the exact "
+            "definitions.",
+            prompt,
+        )
+        self.assertIn("send execute_sql; it starts the verify stage", harness.system)
+        self.assertEqual(
+            [tool["name"] for tool in TestClient(create_app(harness=harness)).get("/health").json()["tools"]],
+            list(TOOL_COSTS),
+        )
+
     def test_all_three_harnesses_expose_only_the_official_tools(self):
         for directory in ("harness/baseline", "harness/sql_review", "harness/context_finder"):
             with self.subTest(directory=directory):
