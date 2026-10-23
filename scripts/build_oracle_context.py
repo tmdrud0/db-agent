@@ -12,6 +12,11 @@ Groups (schema and column meanings; knowledge is the same in all groups):
   and the full schema and column meanings (``curation-inputs``, then
   ``record-selections``)
 - C: the full schema and all column meanings
+- D: the full schema, all column meanings and every knowledge entry the task
+  can see (only the task's deleted knowledge is left out, as the official
+  ``/knowledge`` does). D uses no ground truth; it is what the three official
+  bulk lookups return, and their official price (1 + 1 + 1) equals the 3-coin
+  offset of the experiment mode. D has no phase 2 additions.
 
 Every injected text is cut from the files the official DB service reads and
 serialized the way its tools serialize them:
@@ -48,7 +53,9 @@ DEFAULT_MANIFEST = "eval_sets/lite30.manifest.json"
 DEFAULT_DB_DIR = "vendor/BIRD-Interact/BIRD-Interact-ADK/bird-interact-lite"
 DEFAULT_OUT = "private/oracle_context"
 CURATOR_PROMPT = ROOT / "scripts/oracle_context_curator.md"
-GROUPS = ("A", "B", "C")
+GROUPS = ("A", "B", "C", "D")
+# The groups whose knowledge comes from the ground-truth selection.
+GT_KNOWLEDGE_GROUPS = ("A", "B", "C")
 KNOWLEDGE_VISIBLE_FIELDS = ("id", "knowledge", "description", "definition")
 CURATION_DIR = "curation"
 RAW_DIR = "raw"
@@ -57,6 +64,15 @@ DIAGNOSTIC_NOTE = (
     "Diagnostic oracle-context experiment (TASK-015): knowledge and group A tables are "
     "selected with ground truth. Results are not agent performance."
 )
+FULL_CONTEXT_NOTE = (
+    "Oracle-context experiment (TASK-015), group D: the full official schema, column "
+    "meanings and visible knowledge, selected without ground truth. Lookups are blocked "
+    "and their official price is taken as the 3-coin offset."
+)
+
+
+def group_note(group: str) -> str:
+    return FULL_CONTEXT_NOTE if group == "D" else DIAGNOSTIC_NOTE
 SERIALIZATION = {
     "schema": "whole CREATE TABLE blocks (to the next CREATE TABLE line), schema order",
     "column_meanings": "json.dumps(selected lowercased entries, indent=2), file order",
@@ -337,7 +353,12 @@ def build_task(
 ) -> dict:
     """The context of one task without its generation record."""
     first_ids, second_ids = phase_knowledge(database, record)
-    if group == "C":
+    if group == "D":
+        deleted = deleted_ids(record)
+        visible = [entry["id"] for entry in database.kb if entry.get("id") not in deleted]
+        phase1 = _block(database, database.tables, visible, full=True)
+        phase2 = _block(database, [], [])
+    elif group == "C":
         phase1 = _block(database, database.tables, first_ids, full=True)
         phase2 = _block(database, [], second_ids)
     else:
@@ -350,7 +371,7 @@ def build_task(
     )
     return {
         "experiment": group,
-        "diagnostic": DIAGNOSTIC_NOTE,
+        "diagnostic": group_note(group),
         "task_id": record["instance_id"],
         "db_name": record["selected_database"],
         "phase1": phase1,
@@ -638,7 +659,7 @@ def command_build(args) -> int:
             write_json(directory / f"{record['instance_id']}.json", data)
         write_json(directory / MANIFEST_FILE, {
             "experiment": group,
-            "diagnostic": DIAGNOSTIC_NOTE,
+            "diagnostic": group_note(group),
             "tasks": [record["instance_id"] for record in records],
             "generation": {"inputs": shared_inputs, "generated_at": stamp},
         })
@@ -655,8 +676,19 @@ def command_summary(args) -> int:
             path.stem: json.loads(path.read_text(encoding="utf-8"))
             for path in sorted((paths.out / group).glob("*.json")) if path.name != MANIFEST_FILE
         }
-        for group in GROUPS
+        for group in GT_KNOWLEDGE_GROUPS
     }
+    if (paths.out / "D").is_dir():
+        full = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((paths.out / "D").glob("*.json")) if path.name != MANIFEST_FILE
+        ]
+        if full:
+            sizes = [sum(len(item["phase1"][k]) for k in ("schema", "column_meanings", "knowledge"))
+                     for item in full]
+            counts = [len(item["phase1"]["knowledge_ids"]) for item in full]
+            print(f"D: {len(full)} tasks, knowledge entries {min(counts)}-{max(counts)}, "
+                  f"context chars {min(sizes)}-{max(sizes)} (avg {sum(sizes) // len(sizes)})\n")
     print("| task | db | A p1/p2 | B p1/p2 | C p1 | knowledge p1/p2 | chars A | chars B | chars C |")
     print("|---|---|---|---|---|---|---|---|---|")
     suspicious = []
@@ -664,7 +696,7 @@ def command_summary(args) -> int:
     for record in load_records(paths):
         task = record["instance_id"]
         database = databases[record["selected_database"]]
-        row = {group: contexts[group].get(task) for group in GROUPS}
+        row = {group: contexts[group].get(task) for group in GT_KNOWLEDGE_GROUPS}
         if any(item is None for item in row.values()):
             print(f"| {task} | missing in {[g for g, v in row.items() if v is None]} |")
             continue

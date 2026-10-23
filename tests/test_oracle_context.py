@@ -210,6 +210,32 @@ class GenerationRuleTests(FixtureMixin, unittest.TestCase):
         self.assertEqual(c["phase1"]["knowledge"], a["phase1"]["knowledge"])
         self.assertEqual(c["phase2"]["knowledge"], a["phase2"]["knowledge"])
 
+    def test_d_holds_every_visible_entry_and_the_full_text_without_ground_truth(self):
+        root = self.make_root()
+        database = self.database(root)
+        d = builder.build_task("D", RECORD, database)
+        self.assertEqual(d["phase1"]["schema"], official_schema(root))
+        self.assertEqual(
+            d["phase1"]["column_meanings"], json.dumps(official_meanings(root), indent=2)
+        )
+        # Every entry except the task's deleted one, in file order, like /knowledge.
+        self.assertEqual(d["phase1"]["knowledge_ids"], [0, 1, 2, 4, 5, 6])
+        visible = [
+            {field: entry[field] for field in ("id", "knowledge", "description", "definition")}
+            for entry in KB if entry["id"] != 3
+        ]
+        self.assertEqual(d["phase1"]["knowledge"], json.dumps(visible, indent=2))
+        self.assertEqual(
+            {name: d["phase2"][name] for name in ("schema", "column_meanings", "knowledge")},
+            {"schema": "", "column_meanings": "", "knowledge": ""},
+        )
+        self.assertNotIn("ground truth", d["diagnostic"].replace("without ground truth", ""))
+        # The same file is built when the task's solution SQL changes.
+        changed = {**RECORD, "sol_sql": ["SELECT 1 FROM regions"], "external_knowledge": [2]}
+        self.assertEqual(
+            builder.build_task("D", changed, database)["context_sha256"], d["context_sha256"]
+        )
+
     def test_table_detection_ignores_strings_and_comments_and_reads_prefixes(self):
         tables = ["customers", "orders", "regions"]
         found, relations = builder.sql_tables([SOL_SQL], tables)
