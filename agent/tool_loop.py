@@ -9,9 +9,16 @@ stay under code control.
 """
 
 import asyncio
+import copy
 import json
 import time
 
+from agent.compaction import (
+    drop_messages,
+    stats as compaction_stats,
+    summarize_phase1,
+    tidy_after_submit,
+)
 from agent.environment import Environment, ExecuteResult, GradingError
 from agent.flow import (
     LOCAL_ACTION_SPECS,
@@ -315,6 +322,9 @@ async def _model_call(
         "elapsed_seconds": reply.elapsed_seconds,
         "prompt": [dict(message) for message in messages],
     }
+    # The context clean-up counters so far; the field exists only in that mode.
+    if "context_compaction" in state:
+        event["context_compaction"] = copy.deepcopy(state["context_compaction"])
     # The runner keeps adk_events, so the experiment marker reaches the result JSON.
     if "experiment" in state:
         event["experiment"] = dict(state["experiment"])
@@ -860,6 +870,7 @@ async def run(
     harness: Harness,
     oracle: OracleContext | None = None,
     flow: FlowConfig | None = None,
+    compaction: str | None = None,
 ) -> str:
     _record_harness(state, harness)
     # Repeated requests return the cached outcome instead of calling out again.
@@ -879,7 +890,7 @@ async def run(
             trace = None
     try:
         response = await _session_loop(
-            state, query, environment, model, trace, harness, context, flow
+            state, query, environment, model, trace, harness, context, flow, compaction
         )
     except ModelError as exc:
         if trace is not None:
@@ -909,6 +920,7 @@ async def _session_loop(
     harness: Harness,
     context: TaskContext | None = None,
     flow_config: FlowConfig | None = None,
+    compaction: str | None = None,
 ) -> str:
     started = _now()
     deadline = started + SESSION_TIME_LIMIT_SECONDS
@@ -921,6 +933,13 @@ async def _session_loop(
     staged = (
         StagedFlow(flow_config, state, allowed) if flow_config is not None else None
     )
+    # Rejected responses and their observations wait here until the next
+    # executed action; only the context clean-up mode fills it.
+    rejected: list[dict] = []
+    if compaction is not None:
+        compaction_stats(state, compaction)
+        if staged is not None:
+            staged.compact_plan = True
     messages = [
         {"role": "system", "content": system_prompt(harness, oracle, flow_config)},
         {"role": "user", "content": _initial_prompt(state, query, context, staged)},
@@ -964,7 +983,8 @@ async def _session_loop(
             )
         except SessionExpired as exc:
             return stop("session_time_limit", f"Stopped: {exc}. {_outcome(state)}")
-        messages.append({"role": "assistant", "content": reply.content})
+        raw_reply = {"role": "assistant", "content": reply.content}
+        messages.append(raw_reply)
         # The response may have arrived right at the limit; nothing is executed after it.
         if _remaining(deadline) <= 0:
             if generation is not None:
@@ -1004,11 +1024,20 @@ async def _session_loop(
                     index, phase, "rejected", 0.0, state, reason, flow=staged
                 ),
             })
+            if compaction is not None:
+                rejected.extend([raw_reply, messages[-1]])
             continue
         name, args = parsed.name, parsed.args
         # The executed action replaces the raw response in the dialogue, so invented
         # observations and extra actions never look like real tool output to the model.
         messages[-1] = _action_history(name, args)
+        # The model has seen each rejection reason once; the executed action
+        # shows it recovered, so the rejected turns leave the conversation.
+        if rejected:
+            compaction_stats(state, compaction)["rejections_removed"] += (
+                drop_messages(messages, rejected) // 2
+            )
+            rejected.clear()
         event["action"] = {"name": name, "args": args}
         if parsed.action_count > 1:
             event["action_count"] = parsed.action_count
@@ -1041,6 +1070,14 @@ async def _session_loop(
                 )
                 if outcome is not None:
                     return stop(*outcome)
+                if compaction is not None:
+                    if phase == 1 and int(state.get("current_phase", 1)) == 2:
+                        summarize_phase1(
+                            messages, state, compaction,
+                            staged.data if staged is not None else None,
+                        )
+                    else:
+                        tidy_after_submit(messages, state, compaction)
                 continue
 
             if name == "execute_sql":

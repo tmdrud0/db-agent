@@ -250,6 +250,9 @@ class StagedFlow:
             "rejections": {"stage": 0, "budget": 0, "flow": 0},
         }
         state["flow"] = self.data
+        # Set by the loop when AGENT_CONTEXT_COMPACT is on: the plan observation
+        # then does not repeat the questions and assumptions the model just wrote.
+        self.compact_plan = False
 
     @property
     def stage(self) -> str:
@@ -413,12 +416,18 @@ class StagedFlow:
             })
             self.data["questions"] = questions
             self.data["assumptions"] = assumptions
-            body = (
-                "Plan recorded.\nOpen questions:\n"
-                + ("\n".join(f"- {question}" for question in questions) or "- (none)")
-                + "\nAssumptions:\n"
-                + ("\n".join(f"- {item}" for item in assumptions) or "- (none)")
-            )
+            if self.compact_plan:
+                body = (
+                    f"Plan recorded: {len(questions)} open question(s) and "
+                    f"{len(assumptions)} assumption(s), as written in your plan action."
+                )
+            else:
+                body = (
+                    "Plan recorded.\nOpen questions:\n"
+                    + ("\n".join(f"- {question}" for question in questions) or "- (none)")
+                    + "\nAssumptions:\n"
+                    + ("\n".join(f"- {item}" for item in assumptions) or "- (none)")
+                )
             if questions:
                 self._enter_ask(questions, "plan", action)
                 body += "\n" + self._ask_instruction(len(questions))

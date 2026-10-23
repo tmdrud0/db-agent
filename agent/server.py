@@ -11,6 +11,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from agent.compaction import load_compaction
 from agent.environment import Environment, GradingError
 from agent.flow import FLOW_ENV, FlowConfig, FlowError, load_flow_config
 from agent.harness import Harness, load_harness
@@ -61,6 +62,7 @@ def create_app(
     harness: Harness | None = None,
     oracle_context: OracleContext | None | object = _FROM_ENVIRONMENT,
     flow: FlowConfig | str | None | object = _FROM_ENVIRONMENT,
+    compaction: str | None | object = _FROM_ENVIRONMENT,
 ) -> FastAPI:
     # The tool-selecting loop is the only agent. An explicit request for a
     # removed mode must fail instead of silently running a different agent.
@@ -86,6 +88,10 @@ def create_app(
         load_flow_config() if flow is _FROM_ENVIRONMENT
         else load_flow_config(flow) if isinstance(flow, str)
         else flow
+    )
+    # The context clean-up experiment is on only with AGENT_CONTEXT_COMPACT=ac.
+    compaction_setting = (
+        load_compaction() if compaction is _FROM_ENVIRONMENT else load_compaction(compaction or "")
     )
     if flow_config is not None and harness.sub_agents:
         raise FlowError(
@@ -152,6 +158,8 @@ def create_app(
             info["flow"] = flow_config.descriptor()
         if model.reasoning_effort is not None:
             info["reasoning_effort"] = model.reasoning_effort
+        if compaction_setting is not None:
+            info["context_compaction"] = compaction_setting
         # Only a non-default provider is reported, so /health is otherwise unchanged.
         if getattr(model, "provider", "commandcode") != "commandcode":
             info["model_provider"] = model.provider
@@ -188,6 +196,7 @@ def create_app(
                 response = await run_tool_loop(
                     session.state, req.message, environment, model, active_tracer,
                     harness=harness, oracle=oracle, flow=flow_config,
+                    compaction=compaction_setting,
                 )
             except InputError as exc:
                 raise HTTPException(422, f"Invalid run input: {exc}") from exc
