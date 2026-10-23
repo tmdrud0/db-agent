@@ -59,6 +59,20 @@ function Import-AgentApiKey([string]$PythonExe, [string]$EnvPath) {
     if ($loadedKey) { $env:CMD_API_KEY = $loadedKey }
 }
 
+# AGENT_MODEL_PROVIDER=gms sends the agent's calls to the GMS proxy with
+# GMS_KEY. The simulator still uses CMD_API_KEY.
+function Import-GmsApiKey([string]$PythonExe, [string]$EnvPath) {
+    if ([string]$env:AGENT_MODEL_PROVIDER -ne 'gms') { return }
+    if (!$env:GMS_KEY -and (Test-Path -LiteralPath $EnvPath)) {
+        $loadedKey = & $PythonExe -c "import sys; from dotenv import dotenv_values; sys.stdout.write(dotenv_values(sys.argv[1], encoding='utf-8-sig').get('GMS_KEY') or '')" $EnvPath
+        if ($LASTEXITCODE -ne 0) { throw 'Could not read GMS_KEY from the project .env file.' }
+        if ($loadedKey) { $env:GMS_KEY = $loadedKey }
+    }
+    if (!$env:GMS_KEY) {
+        throw 'AGENT_MODEL_PROVIDER=gms needs GMS_KEY in the project .env file or the current PowerShell environment.'
+    }
+}
+
 function Import-LangfuseSettings([string]$PythonExe, [string]$EnvPath) {
     if (!(Test-Path -LiteralPath $EnvPath)) { return }
 
@@ -182,6 +196,7 @@ Assert-AgentModeEnvironment
 # environment, so the key is loaded before the stack starts. The agent process
 # started below uses the same value.
 Import-AgentApiKey -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
+Import-GmsApiKey -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')
 # Langfuse keys and the run-level trace metadata only reach the host processes;
 # tracing turns into a no-op when either key is missing.
 Import-LangfuseSettings -PythonExe $pythonExe -EnvPath (Join-Path $projectRoot '.env')

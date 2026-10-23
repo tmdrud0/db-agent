@@ -152,6 +152,9 @@ def create_app(
             info["flow"] = flow_config.descriptor()
         if model.reasoning_effort is not None:
             info["reasoning_effort"] = model.reasoning_effort
+        # Only a non-default provider is reported, so /health is otherwise unchanged.
+        if getattr(model, "provider", "commandcode") != "commandcode":
+            info["model_provider"] = model.provider
         return info
 
     @app.post("/init_session")

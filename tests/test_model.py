@@ -9,11 +9,13 @@ import httpx
 
 from agent.model import (
     API_URL,
+    GMS_API_URL,
     MAX_OUTPUT_TOKENS,
     MAX_RETRIES,
     MODEL_ID,
     ModelClient,
     ModelError,
+    model_provider,
 )
 
 
@@ -186,6 +188,106 @@ class ChatRequestTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(requests), MAX_RETRIES + 1)
         self.assertNotIn("fake-secret-key", str(caught.exception))
+
+
+def responses_reply(text: str = "SELECT 1;", status: str = "completed", reason=None) -> dict:
+    return {
+        "model": "gpt-6.1-sol",
+        "status": status,
+        "incomplete_details": {"reason": reason} if reason else None,
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": text}]},
+        ],
+        "usage": {
+            "input_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 4},
+            "output_tokens": 9,
+            "output_tokens_details": {"reasoning_tokens": 6},
+            "total_tokens": 29,
+        },
+    }
+
+
+class GmsResponsesTests(unittest.IsolatedAsyncioTestCase):
+    def client(self, handler, **kwargs) -> ModelClient:
+        return ModelClient(
+            transport=httpx.MockTransport(handler), provider="gms",
+            model_id="gpt-6.1-sol", **kwargs,
+        )
+
+    async def test_request_and_reply_follow_the_responses_contract(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=responses_reply())
+
+        messages = [
+            {"role": "system", "content": "You are a test."},
+            {"role": "user", "content": "How many customers?"},
+        ]
+        reply = await self.client(
+            handler, api_key="fake-key", reasoning_effort="high"
+        ).chat(messages)
+
+        request = requests[0]
+        self.assertEqual(str(request.url), GMS_API_URL)
+        self.assertEqual(request.headers["authorization"], "Bearer fake-key")
+        body = json.loads(request.content)
+        self.assertEqual(body["model"], "gpt-6.1-sol")
+        self.assertEqual(body["input"], messages)
+        self.assertEqual(body["max_output_tokens"], MAX_OUTPUT_TOKENS)
+        self.assertEqual(body["reasoning"], {"effort": "high"})
+        self.assertNotIn("messages", body)
+
+        self.assertEqual(reply.content, "SELECT 1;")
+        self.assertEqual(reply.response_model, "gpt-6.1-sol")
+        self.assertEqual(reply.usage["prompt_tokens"], 20)
+        self.assertEqual(reply.usage["completion_tokens"], 9)
+        self.assertEqual(reply.usage["prompt_tokens_details"], {"cached_tokens": 4})
+        self.assertFalse(reply.truncated)
+
+    async def test_incomplete_output_is_reported_as_truncated(self):
+        def handler(request):
+            return httpx.Response(
+                200, json=responses_reply("SELECT", "incomplete", "max_output_tokens")
+            )
+
+        reply = await self.client(handler, api_key="fake-key").chat(
+            [{"role": "user", "content": "q"}]
+        )
+        self.assertEqual(reply.content, "SELECT")
+        self.assertTrue(reply.truncated)
+
+    async def test_missing_gms_key_fails_before_any_request(self):
+        def handler(request):
+            raise AssertionError("No HTTP request may be sent without a key")
+
+        with mock.patch.dict(os.environ, {"GMS_KEY": ""}):
+            with self.assertRaises(ModelError) as caught:
+                await self.client(handler).chat([{"role": "user", "content": "q"}])
+        self.assertIn("GMS_KEY", str(caught.exception))
+
+    async def test_a_reply_without_output_uses_the_retry_budget(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json={"model": "gpt-6.1-sol"})
+
+        with self.assertRaises(ModelError):
+            await self.client(handler, api_key="fake-key").chat(
+                [{"role": "user", "content": "q"}]
+            )
+        self.assertEqual(len(requests), MAX_RETRIES + 1)
+
+    def test_provider_defaults_to_command_code_and_rejects_unknown_values(self):
+        self.assertEqual(model_provider({}), "commandcode")
+        self.assertEqual(model_provider({"AGENT_MODEL_PROVIDER": " GMS "}), "gms")
+        with self.assertRaises(ValueError):
+            model_provider({"AGENT_MODEL_PROVIDER": "openai"})
 
 
 if __name__ == "__main__":

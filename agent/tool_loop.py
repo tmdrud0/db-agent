@@ -308,7 +308,7 @@ async def _model_call(
         "truncated": reply.truncated,
         "usage": reply.usage,
         "settings": {
-            "endpoint": API_URL,
+            "endpoint": getattr(model, "endpoint", API_URL),
             "timeout_seconds": REQUEST_TIMEOUT_SECONDS,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         },
